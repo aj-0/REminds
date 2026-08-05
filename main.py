@@ -13,6 +13,7 @@ inside that same loop -- see bot.py).
 register OS signal handlers, which only works on the main thread; here it's
 running on a background thread.
 """
+import asyncio
 import logging
 import os
 import threading
@@ -36,6 +37,14 @@ def run_bot():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is not set.")
+
+    # This thread has no event loop by default (Python 3.10+ no longer auto-creates
+    # one outside the main thread; 3.12+/3.14 raise instead of just warning). PTB's
+    # run_polling() internally calls asyncio.get_event_loop(), which needs one
+    # already set as "current" on this thread -- so create and set it explicitly.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     application = build_application(token)
     application.run_polling(stop_signals=None)
 
