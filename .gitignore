@@ -1,6 +1,13 @@
 __pycache__/
 *.pyc
 .env
+data/
 *.db
-venv/
+*.sqlite
+alembic/versions/
+instance/
 .venv/
+venv/
+.env.local
+*.log
+.DS_Store
