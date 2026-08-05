@@ -218,4 +218,31 @@ def format_dt_for_user(dt_utc: datetime, tz_name: str, show_date: bool = True) -
     fmt = "%b %d, %Y at %I:%M %p" if show_date else "%I:%M %p"
     return local.strftime(fmt).replace("AM", "AM").replace("PM", "PM") # Keep case
 
-|
+def parse_bulk_reminders(text: str, tz_name: str) -> List[Tuple[datetime, str]]:
+    """
+    Parses bulk text like:
+    6:00 AM: Wake up
+    6:15 AM: Stretch
+    Returns list of (utc_datetime, text)
+    """
+    lines = text.strip().split('\n')
+    results = []
+    base_date = now_in_tz(tz_name).date()
+    
+    # Regex for "6:00 AM: Text" or "06:00: Text"
+    line_re = re.compile(r'^(\d{1,2}:\d{2}\s*(?:am|pm)?)\s*[:\-]\s*(.+)$', re.IGNORECASE)
+    
+    for line in lines:
+        line = line.strip()
+        if not line: continue
+        m = line_re.match(line)
+        if not m: continue
+        
+        time_str, msg = m.groups()
+        local_dt = parse_time_input(f"{base_date} {time_str}", tz_name)
+        if local_dt:
+            # If time passed today, assume tomorrow for bulk morning routines
+            if local_dt < now_in_tz(tz_name):
+                local_dt += timedelta(days=1)
+            results.append((local_dt.astimezone(timezone.utc), msg.strip()))
+    return results
