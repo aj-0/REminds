@@ -1,3 +1,4 @@
+# main.py
 import os
 import logging
 import threading
@@ -21,7 +22,8 @@ PORT = int(os.getenv("PORT", 10000))
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret")
 
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN not set in .env")
+    # Don't crash import, log error so Gunicorn starts Flask (healthcheck) but bot won't work
+    logger.critical("❌ BOT_TOKEN not set! Bot thread will not start.")
 
 # --- Flask App (Health Check) ---
 flask_app = Flask(__name__)
@@ -33,9 +35,11 @@ def health():
 
 @flask_app.route("/health")
 def health_check():
-    return {"status": "ok", "scheduler_running": True}, 200
+    # Check if bot thread is alive
+    status = "ok" if bot_thread and bot_thread.is_alive() else "bot_thread_dead"
+    return {"status": status, "scheduler_running": status == "ok"}, 200
 
-# --- Bot Thread ---
+# --- Bot Thread Globals ---
 bot_thread: threading.Thread = None
 ptb_application = None
 bot_loop: asyncio.AbstractEventLoop = None
@@ -45,55 +49,71 @@ def run_bot_loop():
     bot_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(bot_loop)
     
-    # Build PTB Application
-    ptb_application = build_application(BOT_TOKEN)
+    logger.info("🧵 Bot Thread: Starting PTB Application...")
     
-    # Initialize Scheduler (needs DB URL)
-    init_scheduler(DATABASE_URL)
-    
-    # Reload jobs from DB into Scheduler
-    # We need to pass the bot instance to scheduler for callbacks
-    # PTB Application has a `bot` attribute after initialize
-    async def post_init(app):
-        await app.initialize()
-        # Reload jobs now that bot is ready
-        reload_all_jobs(app.bot)
-        # Start polling in background task
-        # We use start_polling (non-blocking) because we are in a thread
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
-        logger.info("PTB Polling started in background thread.")
-
-    async def post_shutdown(app):
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
-        shutdown_scheduler()
-
-    ptb_application.post_init = post_init
-    ptb_application.post_shutdown = post_shutdown
-    
-    # Run the loop forever
     try:
+        # Build PTB Application
+        ptb_application = build_application(BOT_TOKEN)
+        
+        # Initialize Scheduler (needs DB URL)
+        init_scheduler(DATABASE_URL)
+        
+        # Post-init: Initialize PTB, Reload Jobs, Start Polling
+        async def post_init(app):
+            await app.initialize()
+            logger.info("🔄 Reloading jobs from DB...")
+            reload_all_jobs(app.bot)
+            await app.start()
+            await app.updater.start_polling(drop_pending_updates=True, allowed_updates=[])
+            logger.info("✅ PTB Polling started in background thread.")
+
+        async def post_shutdown(app):
+            logger.info("🛑 Shutting down PTB...")
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
+            shutdown_scheduler()
+
+        ptb_application.post_init = post_init
+        ptb_application.post_shutdown = post_shutdown
+        
+        # Run the loop forever
         bot_loop.run_forever()
+        
+    except Exception as e:
+        logger.critical(f"💥 Bot Thread Crashed: {e}", exc_info=True)
     finally:
+        logger.info("🧵 Bot Thread: Loop closed.")
         bot_loop.close()
 
 def start_bot_thread():
     global bot_thread
+    if not BOT_TOKEN:
+        logger.error("Cannot start bot thread: BOT_TOKEN missing.")
+        return
+    if bot_thread and bot_thread.is_alive():
+        logger.warning("Bot thread already running.")
+        return
+        
     bot_thread = threading.Thread(target=run_bot_loop, daemon=True, name="PTB-Bot-Thread")
     bot_thread.start()
-    logger.info("Bot thread started.")
+    logger.info("🚀 Bot thread spawned.")
 
-# --- Main Execution ---
+# ============================================================
+# 🔥 CRITICAL: Run on IMPORT (Gunicorn) NOT just __main__
+# ============================================================
+# 1. Init DB
+init_db()
+
+# 2. Start Bot in Background Thread
+start_bot_thread()
+
+# ============================================================
+# Local Dev Entry Point (python main.py)
+# ============================================================
 if __name__ == "__main__":
-    # 1. Init DB
-    init_db()
-    
-    # 2. Start Bot in Background Thread
-    start_bot_thread()
-    
-    # 3. Run Flask (Blocking Main Thread) - Required for Render Web Service
-    # Gunicorn will run this: `gunicorn main:flask_app`
-    # For local dev: `python main.py`
+    # When running locally: `python main.py`
+    # Flask runs in MAIN thread (blocking).
+    # Bot thread is already running above (daemon=True).
+    logger.info(f"🌐 Starting Flask Dev Server on port {PORT}...")
     flask_app.run(host="0.0.0.0", port=PORT)
