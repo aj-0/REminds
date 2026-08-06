@@ -38,10 +38,11 @@ def run_bot():
         logger.error("BOT_TOKEN environment variable not set!")
         sys.exit(1)
     
-    database_url = os.getenv("DATABASE_URL", "sqlite:///reminders.db")
+    mongodb_url = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
+    db_name = os.getenv("MONGODB_DB_NAME", "reminder_bot")
     
     # Create bot instance
-    bot = ReminderBot(token, database_url)
+    bot = ReminderBot(token, mongodb_url, db_name)
     
     # Create new event loop for this thread
     loop = asyncio.new_event_loop()
