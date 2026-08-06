@@ -1,8 +1,9 @@
-python-telegram-bot==21.6
-apscheduler==3.10.4
-sqlalchemy==2.0.32
-alembic==1.13.1
-python-dotenv==1.0.1
-flask==3.0.3
-gunicorn==22.0.0
-pytz==2024.1  # Required for APScheduler timezone handling internals
+python-telegram-bot==21.10
+APScheduler==3.11.0
+SQLAlchemy==2.0.36
+python-dateutil==2.9.0.post0
+pytz==2024.2
+Flask==3.1.0
+Pillow==11.1.0
+pytesseract==0.3.13
+python-dotenv==1.1.0
