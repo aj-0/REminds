@@ -1,411 +1,845 @@
 import logging
-import html
-from datetime import datetime, timezone
-from typing import List, Optional
+import asyncio
+import os
+import json
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Dict, Any
+from io import BytesIO
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, constants
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes, 
-    MessageHandler, filters, ConversationHandler
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    ConversationHandler
 )
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram.constants import ParseMode
 
 from database import (
-    get_db, create_reminder, get_active_reminders, get_reminder, 
-    deactivate_reminder, update_user_tz, get_user_tz, get_user_snoozes, set_user_snoozes,
-    ReminderType, User, Reminder, SessionLocal
+    init_db, get_db, get_user, add_reminder, update_reminder,
+    delete_reminder, get_active_reminders, get_reminder, update_next_run,
+    User, Reminder
 )
-from scheduler import (
-    schedule_reminder_job, remove_reminder_jobs, schedule_snooze_job, 
-    scheduler, send_reminder_callback
-)
+from scheduler import ReminderScheduler
 from utils import (
-    parse_remind_command, format_dt_for_user, parse_bulk_reminders, 
-    get_tz, now_in_tz, ParseResult
+    parse_remind_command, format_reminder_message, parse_bulk_remind,
+    format_list_reminders, extract_text_from_image
 )
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Keyboards ---
+# Conversation states
+SELECTING_ACTION, AWAITING_REMIND_TEXT, AWAITING_EDIT_ID, AWAITING_EDIT_CHANGES = range(4)
 
-def build_reminder_keyboard(reminder_id: int, snooze_options: List[int]) -> InlineKeyboardMarkup:
-    buttons = []
-    row = []
-    for mins in snooze_options:
-        row.append(InlineKeyboardButton(f"😴 Snooze {mins}m", callback_data=f"snooze_{reminder_id}_{mins}"))
-    buttons.append(row)
-    buttons.append([
-        InlineKeyboardButton("✅ Done", callback_data=f"done_{reminder_id}"),
-        InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{reminder_id}")
-    ])
-    return InlineKeyboardMarkup(buttons)
 
-def build_list_keyboard(reminders: List[Reminder]) -> InlineKeyboardMarkup:
-    buttons = []
-    for r in reminders[:10]: # Limit buttons
-        label = f"{r.id}: {r.text[:20]} ({r.type.value})"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"view_{r.id}")])
-    return InlineKeyboardMarkup(buttons) if buttons else None
-
-# --- Helpers ---
-
-async def get_user_timezone(chat_id: int) -> str:
-    with SessionLocal() as db:
-        return get_user_tz(db, chat_id)
-
-def get_user_snoozes_db(chat_id: int) -> List[int]:
-    with SessionLocal() as db:
-        return get_user_snoozes(db, chat_id)
-
-async def send_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "🤖 *Reminder Bot Commands*\n\n"
-        "⏰ *Setting Reminders*\n"
-        "`/remind 2026-08-10 16:00 Text` — One-time exact\n"
-        "`/remind today 16:00 Text` — Today (asks if passed)\n"
-        "`/remind tomorrow 16:00 Text` — Tomorrow\n"
-        "`/remind in 30m Text` — Relative (m, h, d)\n"
-        "`/remind daily 16:00 Text` — Daily recurring\n"
-        "`/remind weekly mon,wed,fri 16:00 Text` — Weekly\n"
-        "`/remind 16:00 Text` — Once today/tomorrow\n\n"
-        "📋 *Management*\n"
-        "`/list` — Show active reminders\n"
-        "`/edit ID new_time_or_text` — Modify reminder\n"
-        "`/delete ID` — Cancel reminder\n"
-        "`/done ID` — Mark one-time as complete\n\n"
-        "⚙️ *Settings*\n"
-        "`/timezone Area/City` — Set your timezone (e.g. `America/New_York`)\n"
-        "`/snoozes 5,15,30` — Customize snooze buttons\n\n"
-        "📦 *Bulk*\n"
-        "`/bulkremind` — Paste a list (see example)\n\n"
-        "💡 *Snooze*: Buttons on reminder messages create a one-off alert. "
-        "Original recurring schedule is unaffected."
-    )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
-
-# --- Command Handlers ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with SessionLocal() as db:
-        get_or_create_user(db, update.effective_chat.id)
-    await update.message.reply_text("👋 Welcome! I'll remind you on time, every time. Use /help to see commands.")
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_help(update, context)
-
-async def timezone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        tz = await get_user_timezone(update.effective_chat.id)
-        await update.message.reply_text(f"Your current timezone: `{tz}`\nUsage: `/timezone America/New_York`", parse_mode="Markdown")
-        return
+class ReminderBot:
+    """Main bot handler class"""
     
-    tz_name = " ".join(args)
-    try:
-        get_tz(tz_name) # Validate
-        with SessionLocal() as db:
-            update_user_tz(db, update.effective_chat.id, tz_name)
-        await update.message.reply_text(f"✅ Timezone set to `{tz_name}`", parse_mode="Markdown")
-    except Exception:
-        await update.message.reply_text("❌ Invalid timezone. Use IANA format (e.g. `Europe/London`, `Asia/Tokyo`).")
-
-async def snoozes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        opts = get_user_snoozes_db(update.effective_chat.id)
-        await update.message.reply_text(f"Current snooze options: `{opts}` minutes.\nUsage: `/snoozes 5,10,20`", parse_mode="Markdown")
-        return
-    try:
-        vals = [int(x.strip()) for x in " ".join(args).split(",") if 0 < int(x.strip()) < 1440]
-        if not vals: raise ValueError
-        with SessionLocal() as db:
-            set_user_snoozes(db, update.effective_chat.id, vals)
-        await update.message.reply_text(f"✅ Snooze options updated: `{vals}`", parse_mode="Markdown")
-    except:
-        await update.message.reply_text("❌ Invalid format. Use comma-separated minutes (e.g. `5,10,15`).")
-
-# --- /remind ---
-
-async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: `/remind <when> <time> [text]`\nExample: `/remind today 16:00 Make coffee`", parse_mode="Markdown")
-        return
-
-    tz_name = await get_user_timezone(chat_id)
-    result: ParseResult = parse_remind_command(args, tz_name)
-
-    if not result.success:
-        await update.message.reply_text(f"❌ {result.error}")
-        return
-
-    # Handle "Today" past time logic
-    now_local = now_in_tz(tz_name)
-    target_local = result.run_time_utc.astimezone(get_tz(tz_name))
+    def __init__(self, token: str, database_url: str):
+        self.token = token
+        self.database_url = database_url
+        
+        # Initialize scheduler with callback
+        self.scheduler = ReminderScheduler(database_url, self._job_callback)
+        
+        # Initialize application
+        self.application = Application.builder().token(token).build()
+        
+        # Register handlers
+        self._register_handlers()
     
-    if result.type == "once" and "today" in " ".join(args[:1]).lower() and target_local < now_local:
-        # Ask user
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("⏭ Tomorrow", callback_data=f"confirm_tomorrow_{result.text}"),
-            InlineKeyboardButton("🚀 Now (ASAP)", callback_data=f"confirm_now_{result.text}")
-        ]])
+    def _register_handlers(self):
+        """Register all command and callback handlers"""
+        app = self.application
+        
+        # Command handlers
+        app.add_handler(CommandHandler("start", self.cmd_start))
+        app.add_handler(CommandHandler("help", self.cmd_help))
+        app.add_handler(CommandHandler("list", self.cmd_list))
+        app.add_handler(CommandHandler("remind", self.cmd_remind))
+        app.add_handler(CommandHandler("bulkremind", self.cmd_bulk_remind))
+        app.add_handler(CommandHandler("edit", self.cmd_edit))
+        app.add_handler(CommandHandler("delete", self.cmd_delete))
+        app.add_handler(CommandHandler("done", self.cmd_done))
+        app.add_handler(CommandHandler("timezone", self.cmd_timezone))
+        app.add_handler(CommandHandler("snoozes", self.cmd_snoozes))
+        
+        # Callback query handler for inline buttons
+        app.add_handler(CallbackQueryHandler(self.handle_callback))
+        
+        # Message handler for image reminders
+        app.add_handler(MessageHandler(filters.PHOTO & filters.CAPTION, self.handle_image_remind))
+        
+        # Error handler
+        app.add_error_handler(self.error_handler)
+    
+    async def _job_callback(self, reminder_id: int, chat_id: int, 
+                            text: str, reminder_type: str,
+                            image_file_id: Optional[str] = None):
+        """Callback function for scheduled jobs"""
+        try:
+            # Get the application's bot
+            bot = self.application.bot
+            
+            # Format message
+            message = f"⏰ **Reminder!**\n\n{text}"
+            
+            # Create keyboard
+            keyboard = [
+                [
+                    InlineKeyboardButton("😴 Snooze 5m", callback_data=f"snooze_{reminder_id}_5"),
+                    InlineKeyboardButton("😴 Snooze 10m", callback_data=f"snooze_{reminder_id}_10"),
+                    InlineKeyboardButton("😴 Snooze 15m", callback_data=f"snooze_{reminder_id}_15"),
+                ],
+                [InlineKeyboardButton("✅ Done", callback_data=f"done_{reminder_id}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            # Send message (with image if available)
+            if image_file_id:
+                sent_message = await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=image_file_id,
+                    caption=message,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=reply_markup
+                )
+            else:
+                sent_message = await bot.send_message(
+                    chat_id=chat_id,
+                    text=message,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=reply_markup
+                )
+            
+            # Update reminder's message_id for snooze editing
+            if reminder_type != 'snooze':
+                db = get_db()
+                try:
+                    update_reminder(db, reminder_id, message_id=sent_message.message_id)
+                finally:
+                    db.close()
+            
+            # Update next_run for recurring reminders
+            if reminder_type in ['daily', 'weekly']:
+                db = get_db()
+                try:
+                    reminder = get_reminder(db, reminder_id)
+                    if reminder and reminder.next_run_utc:
+                        # Calculate next run time
+                        from apscheduler.triggers.cron import CronTrigger
+                        import pytz
+                        
+                        if reminder.type == 'daily':
+                            trigger = CronTrigger(hour=reminder.time_utc.hour, 
+                                                minute=reminder.time_utc.minute,
+                                                timezone='UTC')
+                        else:
+                            days = json.loads(reminder.days_of_week) if isinstance(reminder.days_of_week, str) else (reminder.days_of_week or [])
+                            day_names = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
+                            days_str = ','.join([day_names[d] for d in days])
+                            trigger = CronTrigger(day_of_week=days_str,
+                                                hour=reminder.time_utc.hour,
+                                                minute=reminder.time_utc.minute,
+                                                timezone='UTC')
+                        
+                        next_run = trigger.get_next_fire_time(None, datetime.now(timezone.utc))
+                        if next_run:
+                            update_next_run(db, reminder_id, next_run)
+                finally:
+                    db.close()
+            
+            logger.info(f"Sent reminder #{reminder_id} to chat {chat_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to send reminder #{reminder_id}: {e}")
+    
+    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /start command"""
+        chat_id = update.effective_chat.id
+        
+        # Initialize user
+        db = get_db()
+        try:
+            get_user(db, chat_id)
+        finally:
+            db.close()
+        
         await update.message.reply_text(
-            f"⏰ That time ({target_local.strftime('%I:%M %p')}) has passed today.\n"
-            f"Did you mean *tomorrow* at {target_local.strftime('%I:%M %p')}?",
-            reply_markup=keyboard, parse_mode="Markdown"
+            "👋 **Welcome to the Reminder Bot!**\n\n"
+            "I can help you remember important tasks and events.\n\n"
+            "**Commands:**\n"
+            "• `/remind [time] [text]` - Set a reminder\n"
+            "• `/bulkremind` - Set multiple reminders at once\n"
+            "• `/list` - View all reminders\n"
+            "• `/edit [id] [changes]` - Edit a reminder\n"
+            "• `/delete [id]` - Delete a reminder\n"
+            "• `/done [id]` - Mark reminder as done\n"
+            "• `/timezone [area/city]` - Set your timezone\n"
+            "• `/snoozes [5,10,15]` - Customize snooze options\n"
+            "• `/help` - Show this help message\n\n"
+            "**Examples:**\n"
+            "• `/remind 16:00 Make coffee`\n"
+            "• `/remind tomorrow 09:00 Meeting`\n"
+            "• `/remind daily 07:00 Wake up`\n"
+            "• `/remind weekly mon,wed,fri 18:00 Gym`\n"
+            "• `/remind in 30m Take medicine`\n\n"
+            "📸 You can also send a photo with `/imgremind [time] [text]` in caption!",
+            parse_mode=ParseMode.MARKDOWN
         )
-        # Store pending confirmation in context.user_data
-        context.user_data['pending_remind'] = {
-            'text': result.text, 'time_utc': result.run_time_utc + timedelta(days=1), 'type': 'once'
-        }
-        return
-
-    # Create in DB
-    with SessionLocal() as db:
-        rem = create_reminder(db, chat_id, ReminderType(result.type), result.run_time_utc, result.text, result.days_of_week)
-        db.commit()
-        rem_id = rem.id
-
-    # Schedule Job
-    bot = context.bot
-    schedule_reminder_job(rem, bot)
-
-    # Confirm
-    next_run_str = format_dt_for_user(result.run_time_utc, tz_name)
-    type_str = result.type.capitalize()
-    if result.type == "weekly": type_str += f" ({result.days_of_week})"
     
-    await update.message.reply_text(
-        f"⏰ *Got it!* I'll remind you:\n"
-        f"📝 *{html.escape(result.text)}*\n"
-        f"🕐 *{next_run_str}* ({type_str})",
-        parse_mode="Markdown"
-    )
-
-# --- /bulkremind ---
-
-async def bulkremind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📋 *Bulk Reminder Mode*\n\n"
-        "Send me a list of times and tasks, one per line.\n"
-        "Format: `HH:MM AM/PM: Task description`\n\n"
-        "Example:\n"
-        "`6:00 AM: Wake up and hydrate`\n"
-        "`6:15 AM: Stretch or meditate`\n"
-        "`6:45 AM: Exercise`\n"
-        "`7:30 AM: Healthy breakfast`\n\n"
-        "Times in the past will be scheduled for *tomorrow*.",
-        parse_mode="Markdown"
-    )
-    context.user_data['awaiting_bulk'] = True
-
-async def handle_bulk_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get('awaiting_bulk'): return
-    context.user_data['awaiting_bulk'] = False
+    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /help command"""
+        await self.cmd_start(update, context)
     
-    chat_id = update.effective_chat.id
-    tz_name = await get_user_timezone(chat_id)
-    items = parse_bulk_reminders(update.message.text, tz_name)
+    async def cmd_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /list command"""
+        chat_id = update.effective_chat.id
+        
+        db = get_db()
+        try:
+            user = get_user(db, chat_id)
+            reminders = get_active_reminders(db, chat_id)
+            message = format_list_reminders(reminders, user.timezone)
+            await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+        finally:
+            db.close()
     
-    if not items:
-        await update.message.reply_text("❌ No valid lines found. Use format `6:00 AM: Task`")
-        return
-
-    created = 0
-    with SessionLocal() as db:
-        for run_utc, text in items:
-            rem = create_reminder(db, chat_id, ReminderType.ONCE, run_utc, text)
-            schedule_reminder_job(rem, context.bot)
-            created += 1
-    
-    await update.message.reply_text(f"✅ Created *{created}* one-time reminders for tomorrow morning.", parse_mode="Markdown")
-
-# --- /list ---
-
-async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    tz_name = await get_user_timezone(chat_id)
-    
-    with SessionLocal() as db:
-        rems = get_active_reminders(db, chat_id)
-    
-    if not rems:
-        await update.message.reply_text("📭 No active reminders. Use `/remind` to create one.")
-        return
-
-    lines = ["📋 *Your Active Reminders*"]
-    for r in rems:
-        next_str = format_dt_for_user(r.next_run_utc, tz_name) if r.next_run_utc else "Pending..."
-        type_emoji = "🔁" if r.type != ReminderType.ONCE else "⏰"
-        days = f" [{r.days_of_week}]" if r.days_of_week else ""
-        lines.append(f"{type_emoji} `#{r.id}` {r.text[:40]} — *{next_str}* ({r.type.value}{days})")
-    
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=build_list_keyboard(rems))
-
-# --- /edit ---
-
-async def edit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("Usage: `/edit ID new_time_or_text`\nExample: `/edit 5 17:00` or `/edit 5 New task text`")
-        return
-    
-    chat_id = update.effective_chat.id
-    try: rem_id = int(args[0])
-    except: await update.message.reply_text("Invalid ID."); return
-    
-    new_input = " ".join(args[1:])
-    tz_name = await get_user_timezone(chat_id)
-    
-    with SessionLocal() as db:
-        rem = get_reminder(db, rem_id, chat_id)
-        if not rem: 
-            await update.message.reply_text("❌ Reminder not found.")
+    async def cmd_remind(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /remind command"""
+        chat_id = update.effective_chat.id
+        text = update.message.text.replace('/remind', '', 1).strip()
+        
+        if not text:
+            await update.message.reply_text(
+                "❌ Please provide reminder details.\n"
+                "Example: `/remind 16:00 Make coffee`",
+                parse_mode=ParseMode.MARKDOWN
+            )
             return
         
-        # Heuristic: if input looks like time, update time. Else update text.
-        # Try parse as time first
-        parsed_time = parse_time_input(new_input, tz_name)
-        is_time = parsed_time is not None
+        db = get_db()
+        try:
+            user = get_user(db, chat_id)
+            parsed = parse_remind_command(text, user.timezone)
+            
+            if parsed is None:
+                await update.message.reply_text(
+                    "❌ Could not parse your reminder. Please use format:\n"
+                    "• `/remind HH:MM text`\n"
+                    "• `/remind YYYY-MM-DD HH:MM text`\n"
+                    "• `/remind today/tomorrow HH:MM text`\n"
+                    "• `/remind daily HH:MM text`\n"
+                    "• `/remind weekly day,day HH:MM text`\n"
+                    "• `/remind in Xm/Xh text`",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            # Check if time has passed today
+            if 'suggest_tomorrow' in parsed:
+                original_time = parsed['original_time']
+                keyboard = [
+                    [
+                        InlineKeyboardButton("✅ Today anyway", callback_data=f"confirm_today_{original_time.timestamp()}"),
+                        InlineKeyboardButton("📅 Tomorrow", callback_data=f"confirm_tomorrow_{original_time.timestamp()}"),
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                # Store context for later
+                context.user_data['pending_remind'] = {
+                    'text': parsed.get('text', ''),
+                    'type': parsed.get('type', 'once'),
+                    'days_of_week': parsed.get('days_of_week'),
+                    'original_time': original_time
+                }
+                
+                await update.message.reply_text(
+                    f"⏰ That time ({original_time.strftime('%I:%M %p')}) has already passed today.\n"
+                    "Would you like to set it for today anyway or tomorrow?",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=reply_markup
+                )
+                return
+            
+            # Create the reminder
+            reminder = add_reminder(
+                db, chat_id, parsed['type'],
+                parsed['time_utc'], parsed['text'],
+                parsed.get('days_of_week')
+            )
+            
+            # Schedule the job
+            if parsed['type'] == 'once':
+                self.scheduler.add_one_time_job(
+                    reminder.id, chat_id,
+                    parsed['time_utc'], parsed['text']
+                )
+            elif parsed['type'] == 'daily':
+                self.scheduler.add_daily_job(
+                    reminder.id, chat_id,
+                    parsed['time_utc'].hour, parsed['time_utc'].minute,
+                    parsed['text']
+                )
+            elif parsed['type'] == 'weekly':
+                self.scheduler.add_weekly_job(
+                    reminder.id, chat_id,
+                    parsed['days_of_week'],
+                    parsed['time_utc'].hour, parsed['time_utc'].minute,
+                    parsed['text']
+                )
+            
+            # Format confirmation
+            from pytz import timezone as pytz_timezone
+            tz = pytz_timezone(user.timezone)
+            local_time = pytz.UTC.localize(parsed['time_utc']).astimezone(tz)
+            
+            time_str = local_time.strftime('%I:%M %p').lstrip('0')
+            date_str = local_time.strftime('%A, %B %d, %Y')
+            
+            if parsed['type'] == 'once':
+                confirm = f"⏰ **Got it!** I'll remind you\n\n"
+                confirm += f"📝 **{parsed['text']}**\n"
+                confirm += f"📅 {date_str} at {time_str}"
+            elif parsed['type'] == 'daily':
+                confirm = f"🔁 **Daily reminder set!**\n\n"
+                confirm += f"📝 **{parsed['text']}**\n"
+                confirm += f"⏰ Every day at {time_str}"
+            else:  # weekly
+                days = [['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'][d] 
+                       for d in parsed['days_of_week']]
+                confirm = f"📅 **Weekly reminder set!**\n\n"
+                confirm += f"📝 **{parsed['text']}**\n"
+                confirm += f"📅 {', '.join(days)} at {time_str}"
+            
+            confirm += f"\n\n🆔 Reminder ID: `{reminder.id}`"
+            
+            await update.message.reply_text(confirm, parse_mode=ParseMode.MARKDOWN)
+            
+        finally:
+            db.close()
+    
+    async def cmd_bulk_remind(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /bulkremind command"""
+        chat_id = update.effective_chat.id
+        text = update.message.text.replace('/bulkremind', '', 1).strip()
         
-        if is_time:
-            # Update time
-            new_utc = parsed_time.astimezone(timezone.utc)
-            rem.time_utc = new_utc
-            rem.next_run_utc = new_utc
-            # For recurring, time_utc stores time component. 
-            # We need to preserve date part for 'once', but for cron we only need hour/min.
-            # APScheduler CronTrigger uses hour/min from trigger. 
-            # We reschedule job completely.
-            msg = f"⏰ Time updated to {format_dt_for_user(new_utc, tz_name)}"
+        if not text:
+            await update.message.reply_text(
+                "❌ Please provide reminders in this format:\n"
+                "`/bulkremind`\n"
+                "`* 6:00 AM: Wake up`\n"
+                "`* 6:15 AM: Stretch`\n"
+                "`* 6:45 AM: Exercise`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        db = get_db()
+        try:
+            user = get_user(db, chat_id)
+            reminders_data = parse_bulk_remind(text, user.timezone)
+            
+            if not reminders_data:
+                await update.message.reply_text(
+                    "❌ Could not parse reminders. Please use format:\n"
+                    "`* HH:MM: Task description`",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            created = []
+            for data in reminders_data:
+                reminder = add_reminder(
+                    db, chat_id, 'once',
+                    data['time_utc'], data['text']
+                )
+                self.scheduler.add_one_time_job(
+                    reminder.id, chat_id,
+                    data['time_utc'], data['text']
+                )
+                created.append(reminder)
+            
+            await update.message.reply_text(
+                f"✅ **Created {len(created)} reminders!**\n\n"
+                + '\n'.join([f"• `{r.id}` - {r.text}" for r in created]),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+        finally:
+            db.close()
+    
+    async def handle_image_remind(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle image with caption for reminder"""
+        chat_id = update.effective_chat.id
+        caption = update.message.caption
+        
+        if not caption or not caption.startswith('/imgremind'):
+            return
+        
+        # Extract command text
+        text = caption.replace('/imgremind', '', 1).strip()
+        
+        if not text:
+            await update.message.reply_text(
+                "❌ Please provide time and text in caption.\n"
+                "Example: `/imgremind 18.8.2026 7.00PM Buy groceries`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Get image file ID
+        if update.message.photo:
+            image_file_id = update.message.photo[-1].file_id
         else:
-            # Update text
-            rem.text = new_input
-            msg = f"📝 Text updated."
+            image_file_id = None
         
-        db.commit()
+        db = get_db()
+        try:
+            user = get_user(db, chat_id)
+            parsed = parse_remind_command(text, user.timezone)
+            
+            if parsed is None:
+                await update.message.reply_text(
+                    "❌ Could not parse time. Please use format:\n"
+                    "`/imgremind DD.MM.YYYY HH:MM AM/PM Description`",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            # Create reminder with image
+            reminder = add_reminder(
+                db, chat_id, 'once',
+                parsed['time_utc'], parsed['text'],
+                image_file_id=image_file_id
+            )
+            
+            # Schedule with image
+            self.scheduler.add_one_time_job(
+                reminder.id, chat_id,
+                parsed['time_utc'], parsed['text'],
+                image_file_id
+            )
+            
+            # Confirm
+            from pytz import timezone as pytz_timezone
+            tz = pytz_timezone(user.timezone)
+            local_time = pytz.UTC.localize(parsed['time_utc']).astimezone(tz)
+            
+            await update.message.reply_text(
+                f"📸 **Image reminder set!**\n\n"
+                f"📝 **{parsed['text']}**\n"
+                f"📅 {local_time.strftime('%A, %B %d, %Y')} at "
+                f"{local_time.strftime('%I:%M %p').lstrip('0')}\n"
+                f"🆔 ID: `{reminder.id}`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+        finally:
+            db.close()
     
-    # Reschedule
-    schedule_reminder_job(rem, context.bot)
-    await update.message.reply_text(f"✅ Reminder #{rem_id} updated. {msg}")
-
-# --- /delete /done ---
-
-async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args: await update.message.reply_text("Usage: `/delete ID`"); return
-    chat_id = update.effective_chat.id
-    try: rem_id = int(args[0])
-    except: await update.message.reply_text("Invalid ID."); return
-    
-    with SessionLocal() as db:
-        if deactivate_reminder(db, rem_id, chat_id):
-            remove_reminder_jobs(rem_id)
-            await update.message.reply_text(f"🗑 Reminder #{rem_id} deleted.")
-        else:
-            await update.message.reply_text("❌ Not found.")
-
-async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Alias for delete for one-time, but semantically "complete"
-    await delete_cmd(update, context)
-
-# --- Callback Queries (Buttons) ---
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    chat_id = query.message.chat_id
-    msg_id = query.message.message_id
-    bot = context.bot
-
-    # Snooze: snooze_{rem_id}_{mins}
-    if data.startswith("snooze_"):
-        _, rem_id_str, mins_str = data.split("_")
-        rem_id, mins = int(rem_id_str), int(mins_str)
+    async def cmd_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /edit command"""
+        chat_id = update.effective_chat.id
+        text = update.message.text.replace('/edit', '', 1).strip()
         
-        # Edit current message
-        await query.edit_message_text(
-            f"{query.message.text}\n\n🔁 *Snoozed for {mins} minutes.*",
-            parse_mode="Markdown"
-        )
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await update.message.reply_text(
+                "❌ Usage: `/edit [id] [new time and/or text]`\n"
+                "Example: `/edit 5 17:00 Buy groceries`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
         
-        # Schedule snooze job (sends new reminder later)
-        schedule_snooze_job(rem_id, mins, context.bot)
-        return
-
-    # Done: done_{rem_id}
-    if data.startswith("done_"):
-        rem_id = int(data.split("_")[1])
-        with SessionLocal() as db:
-            if deactivate_reminder(db, rem_id, chat_id):
-                remove_reminder_jobs(rem_id)
-        await query.edit_message_text(f"{query.message.text}\n\n✅ *Marked as done.*", parse_mode="Markdown")
-        return
-
-    # Delete: delete_{rem_id}
-    if data.startswith("delete_"):
-        rem_id = int(data.split("_")[1])
-        with SessionLocal() as db:
-            if deactivate_reminder(db, rem_id, chat_id):
-                remove_reminder_jobs(rem_id)
-        await query.edit_message_text(f"{query.message.text}\n\n🗑 *Deleted.*", parse_mode="Markdown")
-        return
-
-    # Confirm Tomorrow (from /remind today past time)
-    if data.startswith("confirm_tomorrow_"):
-        text = data.split("_", 2)[2]
-        pending = context.user_data.get('pending_remind')
-        if pending and pending['text'] == text:
-            with SessionLocal() as db:
-                rem = create_reminder(db, chat_id, ReminderType.ONCE, pending['time_utc'], text)
-                schedule_reminder_job(rem, bot)
-            tz = await get_user_timezone(chat_id)
-            next_str = format_dt_for_user(pending['time_utc'], tz)
-            await query.edit_message_text(f"⏰ Set for *tomorrow* at {next_str}.", parse_mode="Markdown")
-            context.user_data.pop('pending_remind', None)
-        return
-
-    if data.startswith("confirm_now_"):
-        text = data.split("_", 2)[2]
-        pending = context.user_data.get('pending_remind')
-        if pending and pending['text'] == text:
-            with SessionLocal() as db:
-                rem = create_reminder(db, chat_id, ReminderType.ONCE, datetime.now(timezone.utc), text)
-                schedule_reminder_job(rem, bot)
-            await query.edit_message_text(f"⏰ Reminder set for *now*.", parse_mode="Markdown")
-            context.user_data.pop('pending_remind', None)
-        return
-
-# --- Error Handler ---
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Update {update} caused error: {context.error}")
-
-# --- Application Builder ---
-def build_application(token: str) -> Application:
-    app = Application.builder().token(token).build()
+        reminder_id = int(parts[0])
+        changes = parts[1]
+        
+        db = get_db()
+        try:
+            user = get_user(db, chat_id)
+            reminder = get_reminder(db, reminder_id)
+            
+            if not reminder or reminder.chat_id != chat_id:
+                await update.message.reply_text("❌ Reminder not found.")
+                return
+            
+            # Parse new time/text
+            parsed = parse_remind_command(changes, user.timezone)
+            
+            if parsed is None:
+                await update.message.reply_text("❌ Could not parse changes.")
+                return
+            
+            # Update database
+            update_data = {
+                'time_utc': parsed['time_utc'],
+                'text': parsed['text'],
+                'type': parsed.get('type', reminder.type),
+                'days_of_week': json.dumps(parsed.get('days_of_week')) if parsed.get('days_of_week') else reminder.days_of_week
+            }
+            
+            update_reminder(db, reminder_id, **update_data)
+            
+            # Reschedule job
+            job_id = f"reminder_{reminder_id}"
+            self.scheduler.remove_job(job_id)
+            
+            if update_data['type'] == 'once':
+                self.scheduler.add_one_time_job(
+                    reminder_id, chat_id,
+                    parsed['time_utc'], parsed['text']
+                )
+            elif update_data['type'] == 'daily':
+                self.scheduler.add_daily_job(
+                    reminder_id, chat_id,
+                    parsed['time_utc'].hour, parsed['time_utc'].minute,
+                    parsed['text']
+                )
+            elif update_data['type'] == 'weekly':
+                self.scheduler.add_weekly_job(
+                    reminder_id, chat_id,
+                    parsed['days_of_week'],
+                    parsed['time_utc'].hour, parsed['time_utc'].minute,
+                    parsed['text']
+                )
+            
+            await update.message.reply_text(
+                f"✅ **Reminder #{reminder_id} updated!**\n"
+                f"📝 New: {parsed['text']}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+        finally:
+            db.close()
     
-    # Commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("timezone", timezone_cmd))
-    app.add_handler(CommandHandler("snoozes", snoozes_cmd))
-    app.add_handler(CommandHandler("remind", remind_cmd))
-    app.add_handler(CommandHandler("bulkremind", bulkremind_cmd))
-    app.add_handler(CommandHandler("list", list_cmd))
-    app.add_handler(CommandHandler("edit", edit_cmd))
-    app.add_handler(CommandHandler("delete", delete_cmd))
-    app.add_handler(CommandHandler("done", done_cmd))
+    async def cmd_delete(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /delete command"""
+        chat_id = update.effective_chat.id
+        text = update.message.text.replace('/delete', '', 1).strip()
+        
+        if not text:
+            await update.message.reply_text(
+                "❌ Usage: `/delete [id]`\n"
+                "Example: `/delete 5`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        try:
+            reminder_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ Invalid ID. Please provide a number.")
+            return
+        
+        db = get_db()
+        try:
+            reminder = get_reminder(db, reminder_id)
+            
+            if not reminder or reminder.chat_id != chat_id:
+                await update.message.reply_text("❌ Reminder not found.")
+                return
+            
+            # Remove from scheduler
+            self.scheduler.remove_job(f"reminder_{reminder_id}")
+            
+            # Delete from database
+            delete_reminder(db, reminder_id)
+            
+            await update.message.reply_text(
+                f"🗑️ **Reminder #{reminder_id} deleted.**\n"
+                f"📝 '{reminder.text}'",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+        finally:
+            db.close()
     
-    # Callbacks
-    app.add_handler(CallbackQueryHandler(button_callback))
+    async def cmd_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /done command"""
+        chat_id = update.effective_chat.id
+        text = update.message.text.replace('/done', '', 1).strip()
+        
+        if not text:
+            await update.message.reply_text(
+                "❌ Usage: `/done [id]`\n"
+                "Example: `/done 5`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        try:
+            reminder_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ Invalid ID.")
+            return
+        
+        db = get_db()
+        try:
+            reminder = get_reminder(db, reminder_id)
+            
+            if not reminder or reminder.chat_id != chat_id:
+                await update.message.reply_text("❌ Reminder not found.")
+                return
+            
+            # Only mark one-time reminders as done
+            if reminder.type != 'once':
+                await update.message.reply_text(
+                    "❌ Can only mark one-time reminders as done. "
+                    "Use `/delete` for recurring reminders.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            # Remove from scheduler
+            self.scheduler.remove_job(f"reminder_{reminder_id}")
+            
+            # Mark as inactive
+            update_reminder(db, reminder_id, active=False)
+            
+            await update.message.reply_text(
+                f"✅ **Reminder #{reminder_id} marked as done!**\n"
+                f"📝 '{reminder.text}'",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+        finally:
+            db.close()
     
-    # Bulk Text Handler (Must be after commands)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bulk_text))
+    async def cmd_timezone(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /timezone command"""
+        chat_id = update.effective_chat.id
+        text = update.message.text.replace('/timezone', '', 1).strip()
+        
+        if not text:
+            await update.message.reply_text(
+                "❌ Please provide your timezone.\n"
+                "Example: `/timezone America/New_York`\n"
+                "Find yours at: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Validate timezone
+        import pytz
+        try:
+            pytz.timezone(text)
+        except pytz.exceptions.UnknownTimeZoneError:
+            await update.message.reply_text(
+                f"❌ Unknown timezone: `{text}`\n"
+                "Please use format like: `America/New_York`, `Europe/London`, `Asia/Tokyo`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        db = get_db()
+        try:
+            user = get_user(db, chat_id)
+            user.timezone = text
+            db.commit()
+            
+            await update.message.reply_text(
+                f"✅ **Timezone updated!**\n"
+                f"🕐 Your timezone is now: `{text}`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+        finally:
+            db.close()
     
-    # Errors
-    app.add_error_handler(error_handler)
+    async def cmd_snoozes(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /snoozes command"""
+        chat_id = update.effective_chat.id
+        text = update.message.text.replace('/snoozes', '', 1).strip()
+        
+        if not text:
+            await update.message.reply_text(
+                "❌ Please provide snooze durations in minutes, separated by commas.\n"
+                "Example: `/snoozes 5,10,15`\n"
+                "Current default: 5, 10, 15 minutes",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Validate format
+        parts = text.split(',')
+        try:
+            minutes = [int(p.strip()) for p in parts]
+            if any(m < 1 or m > 120 for m in minutes):
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Invalid format. Please provide numbers between 1 and 120, separated by commas.\n"
+                "Example: `/snoozes 5,10,15`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        db = get_db()
+        try:
+            user = get_user(db, chat_id)
+            user.snooze_options = ','.join(str(m) for m in minutes[:5])  # Max 5 options
+            db.commit()
+            
+            await update.message.reply_text(
+                f"✅ **Snooze options updated!**\n"
+                f"🔔 Snooze buttons: {', '.join(str(m) + 'm' for m in minutes[:5])}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+        finally:
+            db.close()
     
-    return app
+    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle inline button callbacks"""
+        query = update.callback_query
+        await query.answer()
+        
+        data = query.data
+        
+        # Handle snooze
+        if data.startswith('snooze_'):
+            parts = data.split('_')
+            reminder_id = int(parts[1])
+            delay = int(parts[2])
+            
+            db = get_db()
+            try:
+                reminder = get_reminder(db, reminder_id)
+                if not reminder:
+                    await query.edit_message_text("❌ Reminder no longer exists.")
+                    return
+                
+                # Add snooze job
+                self.scheduler.add_snooze_job(
+                    reminder_id, query.message.chat.id,
+                    delay, reminder.text, reminder.image_file_id
+                )
+                
+                # Update message
+                await query.edit_message_text(
+                    f"🔁 **Snoozed for {delay} minutes**\n\n"
+                    f"📝 '{reminder.text}'",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
+            finally:
+                db.close()
+        
+        # Handle done
+        elif data.startswith('done_'):
+            reminder_id = int(data.split('_')[1])
+            
+            db = get_db()
+            try:
+                reminder = get_reminder(db, reminder_id)
+                if not reminder:
+                    await query.edit_message_text("❌ Reminder no longer exists.")
+                    return
+                
+                # Mark as done
+                update_reminder(db, reminder_id, active=False)
+                
+                # Remove job
+                self.scheduler.remove_job(f"reminder_{reminder_id}")
+                
+                await query.edit_message_text(
+                    f"✅ **Done!**\n\n"
+                    f"📝 '{reminder.text}'",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
+            finally:
+                db.close()
+        
+        # Handle time confirmation (today/tomorrow)
+        elif data.startswith('confirm_'):
+            parts = data.split('_')
+            option = parts[1]  # today or tomorrow
+            timestamp = float(parts[2])
+            original_time = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            
+            pending = context.user_data.get('pending_remind', {})
+            if not pending:
+                await query.edit_message_text("❌ Session expired. Please try again.")
+                return
+            
+            chat_id = query.message.chat.id
+            
+            if option == 'tomorrow':
+                original_time += timedelta(days=1)
+            
+            # Create reminder with confirmed time
+            db = get_db()
+            try:
+                user = get_user(db, chat_id)
+                
+                reminder = add_reminder(
+                    db, chat_id, pending.get('type', 'once'),
+                    original_time, pending.get('text', ''),
+                    pending.get('days_of_week')
+                )
+                
+                # Schedule
+                self.scheduler.add_one_time_job(
+                    reminder.id, chat_id,
+                    original_time, pending['text']
+                )
+                
+                # Format confirmation
+                from pytz import timezone as pytz_timezone
+                tz = pytz_timezone(user.timezone)
+                local_time = pytz.UTC.localize(original_time).astimezone(tz)
+                
+                await query.edit_message_text(
+                    f"⏰ **Got it!**\n\n"
+                    f"📝 **{pending['text']}**\n"
+                    f"📅 {local_time.strftime('%A, %B %d, %Y')} at "
+                    f"{local_time.strftime('%I:%M %p').lstrip('0')}\n"
+                    f"🆔 ID: `{reminder.id}`",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
+            finally:
+                db.close()
+                context.user_data.pop('pending_remind', None)
+    
+    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle errors"""
+        logger.error(f"Update {update} caused error {context.error}")
+        
+        if update and update.effective_message:
+            await update.effective_message.reply_text(
+                "❌ An error occurred. Please try again later.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    async def start(self):
+        """Start the bot"""
+        # Initialize database
+        init_db()
+        
+        # Start scheduler
+        self.scheduler.start()
+        
+        # Reload reminders from database
+        self.scheduler.reload_reminders(get_db, get_active_reminders)
+        
+        # Start polling
+        await self.application.initialize()
+        await self.application.start()
+        await self.application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        
+        logger.info("Bot started")
+    
+    async def stop(self):
+        """Stop the bot"""
+        await self.application.updater.stop()
+        await self.application.stop()
+        await self.application.shutdown()
+        self.scheduler.shutdown()
+        logger.info("Bot stopped")
