@@ -1,13 +1,23 @@
-__pycache__/
-*.pyc
+# Environment
 .env
-data/
+*.pyc
+__pycache__/
 *.db
-*.sqlite
-alembic/versions/
-instance/
-.venv/
-venv/
-.env.local
-*.log
+*.db-journal
+*.db-wal
+*.db-shm
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Distribution
+dist/
+build/
+*.egg-info/
