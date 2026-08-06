@@ -1,164 +1,245 @@
 import os
 import json
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, JSON, func
-from sqlalchemy.orm import declarative_base, sessionmaker, Session
-from sqlalchemy.pool import StaticPool
+from typing import Optional, List, Dict, Any, Tuple
+from pymongo import MongoClient
+from pymongo.collection import Collection
+from bson import ObjectId
 from dotenv import load_dotenv
+import pytz
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///reminders.db")
+# MongoDB connection
+MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
+DB_NAME = os.getenv("MONGODB_DB_NAME", "reminder_bot")
 
-# Handle Render's PostgreSQL URL format
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+class Database:
+    """MongoDB database handler"""
+    
+    def __init__(self):
+        self.client = MongoClient(MONGODB_URL)
+        self.db = self.client[DB_NAME]
+        self.reminders = self.db['reminders']
+        self.users = self.db['users']
+        self._create_indexes()
+    
+    def _create_indexes(self):
+        """Create database indexes for performance"""
+        self.reminders.create_index('chat_id')
+        self.reminders.create_index('active')
+        self.reminders.create_index([('chat_id', 1), ('active', 1)])
+        self.users.create_index('chat_id', unique=True)
+    
+    def close(self):
+        """Close database connection"""
+        self.client.close()
 
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
-    poolclass=StaticPool if "sqlite" in DATABASE_URL else None,
-    echo=False
-)
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+# Singleton database instance
+_db_instance = None
+
+def get_db() -> Database:
+    """Get or create database instance"""
+    global _db_instance
+    if _db_instance is None:
+        _db_instance = Database()
+    return _db_instance
+
+def init_db():
+    """Initialize database (create indexes)"""
+    db = get_db()
+    db._create_indexes()
+    print("Database initialized with MongoDB")
 
 
-class Reminder(Base):
-    __tablename__ = "reminders"
-
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    chat_id = Column(Integer, nullable=False, index=True)
-    message_id = Column(Integer, nullable=True)
-    type = Column(String(10), nullable=False)  # once, daily, weekly
-    time_utc = Column(DateTime, nullable=False)
-    days_of_week = Column(String(100), nullable=True)  # JSON list for weekly
-    text = Column(Text, nullable=False)
-    active = Column(Boolean, default=True)
-    next_run_utc = Column(DateTime, nullable=True)
-    image_file_id = Column(String(255), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
+class Reminder:
+    """Reminder model"""
+    
+    def __init__(self, data: dict):
+        self.id = str(data.get('_id', data.get('id', '')))
+        self.chat_id = data.get('chat_id')
+        self.message_id = data.get('message_id')
+        self.type = data.get('type', 'once')  # once, daily, weekly
+        self.time_utc = data.get('time_utc')
+        self.days_of_week = data.get('days_of_week', [])
+        self.text = data.get('text', '')
+        self.active = data.get('active', True)
+        self.next_run_utc = data.get('next_run_utc')
+        self.image_file_id = data.get('image_file_id')
+        self.created_at = data.get('created_at', datetime.utcnow())
+        self.updated_at = data.get('updated_at', datetime.utcnow())
+    
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "id": self.id,
-            "chat_id": self.chat_id,
-            "message_id": self.message_id,
-            "type": self.type,
-            "time_utc": self.time_utc.isoformat() if self.time_utc else None,
-            "days_of_week": json.loads(self.days_of_week) if self.days_of_week else [],
-            "text": self.text,
-            "active": self.active,
-            "next_run_utc": self.next_run_utc.isoformat() if self.next_run_utc else None,
-            "image_file_id": self.image_file_id,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
+            'id': self.id,
+            'chat_id': self.chat_id,
+            'message_id': self.message_id,
+            'type': self.type,
+            'time_utc': self.time_utc.isoformat() if isinstance(self.time_utc, datetime) else self.time_utc,
+            'days_of_week': self.days_of_week,
+            'text': self.text,
+            'active': self.active,
+            'next_run_utc': self.next_run_utc.isoformat() if isinstance(self.next_run_utc, datetime) else self.next_run_utc,
+            'image_file_id': self.image_file_id,
+            'created_at': self.created_at.isoformat() if isinstance(self.created_at, datetime) else self.created_at,
         }
 
 
-class User(Base):
-    __tablename__ = "users"
-
-    chat_id = Column(Integer, primary_key=True, index=True)
-    timezone = Column(String(50), default="UTC")
-    snooze_options = Column(String(50), default="5,10,15")  # comma-separated minutes
-    created_at = Column(DateTime, default=datetime.utcnow)
-
+class User:
+    """User model"""
+    
+    def __init__(self, data: dict):
+        self.chat_id = data.get('chat_id')
+        self.timezone = data.get('timezone', 'UTC')
+        self.snooze_options = data.get('snooze_options', '5,10,15')
+        self.created_at = data.get('created_at', datetime.utcnow())
+    
     def get_snooze_options(self) -> List[int]:
         try:
-            return [int(x.strip()) for x in self.snooze_options.split(",")]
+            return [int(x.strip()) for x in self.snooze_options.split(',')]
         except:
             return [5, 10, 15]
 
 
-def init_db():
-    """Initialize database tables"""
-    Base.metadata.create_all(bind=engine)
-
-
-def get_db() -> Session:
-    """Get database session"""
-    db = SessionLocal()
-    try:
-        return db
-    except:
-        db.close()
-        raise
-
-
-def get_user(db: Session, chat_id: int) -> Optional[User]:
+def get_user(chat_id: int) -> User:
     """Get or create user"""
-    user = db.query(User).filter(User.chat_id == chat_id).first()
-    if not user:
-        user = User(chat_id=chat_id)
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-    return user
+    db = get_db()
+    user_data = db.users.find_one({'chat_id': chat_id})
+    
+    if not user_data:
+        user_data = {
+            'chat_id': chat_id,
+            'timezone': 'UTC',
+            'snooze_options': '5,10,15',
+            'created_at': datetime.utcnow()
+        }
+        db.users.insert_one(user_data)
+    
+    return User(user_data)
 
 
-def add_reminder(db: Session, chat_id: int, type: str, time_utc: datetime,
+def add_reminder(chat_id: int, type: str, time_utc: datetime,
                  text: str, days_of_week: Optional[List[str]] = None,
                  image_file_id: Optional[str] = None) -> Reminder:
     """Add a new reminder"""
-    reminder = Reminder(
-        chat_id=chat_id,
-        type=type,
-        time_utc=time_utc,
-        days_of_week=json.dumps(days_of_week) if days_of_week else None,
-        text=text,
-        active=True,
-        next_run_utc=time_utc,
-        image_file_id=image_file_id
-    )
-    db.add(reminder)
-    db.commit()
-    db.refresh(reminder)
-    return reminder
+    db = get_db()
+    
+    reminder_data = {
+        'chat_id': chat_id,
+        'message_id': None,
+        'type': type,
+        'time_utc': time_utc,
+        'days_of_week': days_of_week or [],
+        'text': text,
+        'active': True,
+        'next_run_utc': time_utc,
+        'image_file_id': image_file_id,
+        'created_at': datetime.utcnow(),
+        'updated_at': datetime.utcnow()
+    }
+    
+    result = db.reminders.insert_one(reminder_data)
+    reminder_data['_id'] = result.inserted_id
+    return Reminder(reminder_data)
 
 
-def update_reminder(db: Session, reminder_id: int, **kwargs) -> Optional[Reminder]:
+def update_reminder(reminder_id: str, **kwargs) -> Optional[Reminder]:
     """Update a reminder"""
-    reminder = db.query(Reminder).filter(Reminder.id == reminder_id).first()
-    if reminder:
-        for key, value in kwargs.items():
-            if key == 'days_of_week' and value is not None:
-                value = json.dumps(value)
-            setattr(reminder, key, value)
-        reminder.updated_at = datetime.utcnow()
-        db.commit()
-        db.refresh(reminder)
-    return reminder
+    db = get_db()
+    
+    # Convert string ID to ObjectId if needed
+    from bson.objectid import ObjectId
+    try:
+        obj_id = ObjectId(reminder_id)
+    except:
+        obj_id = reminder_id
+    
+    update_data = {k: v for k, v in kwargs.items() if v is not None}
+    update_data['updated_at'] = datetime.utcnow()
+    
+    # Handle days_of_week serialization
+    if 'days_of_week' in update_data and isinstance(update_data['days_of_week'], list):
+        update_data['days_of_week'] = update_data['days_of_week']
+    
+    result = db.reminders.find_one_and_update(
+        {'_id': obj_id},
+        {'$set': update_data},
+        return_document=True
+    )
+    
+    if result:
+        return Reminder(result)
+    return None
 
 
-def delete_reminder(db: Session, reminder_id: int) -> bool:
+def delete_reminder(reminder_id: str) -> bool:
     """Delete a reminder"""
-    reminder = db.query(Reminder).filter(Reminder.id == reminder_id).first()
-    if reminder:
-        db.delete(reminder)
-        db.commit()
-        return True
-    return False
+    db = get_db()
+    
+    from bson.objectid import ObjectId
+    try:
+        obj_id = ObjectId(reminder_id)
+    except:
+        obj_id = reminder_id
+    
+    result = db.reminders.delete_one({'_id': obj_id})
+    return result.deleted_count > 0
 
 
-def get_active_reminders(db: Session, chat_id: Optional[int] = None) -> List[Reminder]:
+def get_active_reminders(chat_id: Optional[int] = None) -> List[Reminder]:
     """Get all active reminders"""
-    query = db.query(Reminder).filter(Reminder.active == True)
+    db = get_db()
+    
+    query = {'active': True}
     if chat_id:
-        query = query.filter(Reminder.chat_id == chat_id)
-    return query.order_by(Reminder.next_run_utc).all()
+        query['chat_id'] = chat_id
+    
+    cursor = db.reminders.find(query).sort('next_run_utc', 1)
+    return [Reminder(doc) for doc in cursor]
 
 
-def get_reminder(db: Session, reminder_id: int) -> Optional[Reminder]:
-    """Get a specific reminder"""
-    return db.query(Reminder).filter(Reminder.id == reminder_id).first()
+def get_reminder(reminder_id: str) -> Optional[Reminder]:
+    """Get a specific reminder by ID"""
+    db = get_db()
+    
+    from bson.objectid import ObjectId
+    try:
+        obj_id = ObjectId(reminder_id)
+    except:
+        obj_id = reminder_id
+    
+    doc = db.reminders.find_one({'_id': obj_id})
+    return Reminder(doc) if doc else None
 
 
-def update_next_run(db: Session, reminder_id: int, next_run: datetime):
+def update_next_run(reminder_id: str, next_run: datetime):
     """Update next run time for a reminder"""
-    reminder = db.query(Reminder).filter(Reminder.id == reminder_id).first()
-    if reminder:
-        reminder.next_run_utc = next_run
-        db.commit()
+    db = get_db()
+    
+    from bson.objectid import ObjectId
+    try:
+        obj_id = ObjectId(reminder_id)
+    except:
+        obj_id = reminder_id
+    
+    db.reminders.update_one(
+        {'_id': obj_id},
+        {'$set': {'next_run_utc': next_run, 'updated_at': datetime.utcnow()}}
+    )
+
+
+def get_reminders_by_ids(reminder_ids: List[str]) -> List[Reminder]:
+    """Get multiple reminders by IDs"""
+    db = get_db()
+    
+    from bson.objectid import ObjectId
+    obj_ids = []
+    for rid in reminder_ids:
+        try:
+            obj_ids.append(ObjectId(rid))
+        except:
+            pass
+    
+    cursor = db.reminders.find({'_id': {'$in': obj_ids}})
+    return [Reminder(doc) for doc in cursor]
