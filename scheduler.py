@@ -5,25 +5,23 @@ from typing import Optional, List, Dict, Any, Callable
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.cron import CronTrigger
-from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR
-from sqlalchemy import create_engine
 import json
 
 logger = logging.getLogger(__name__)
 
 
 class ReminderScheduler:
-    """Manages APScheduler for reminder jobs"""
+    """Manages APScheduler for reminder jobs (MongoDB version)"""
     
-    def __init__(self, database_url: str, job_callback: Callable):
-        self.database_url = database_url
+    def __init__(self, job_callback: Callable):
         self.job_callback = job_callback
         
-        # Configure job store
+        # Use in-memory job store (no SQLAlchemy needed)
         jobstores = {
-            'default': SQLAlchemyJobStore(url=database_url)
+            'default': MemoryJobStore()
         }
         
         executors = {
@@ -66,7 +64,7 @@ class ReminderScheduler:
         self.scheduler.shutdown(wait=wait)
         logger.info("Scheduler shutdown")
     
-    def add_one_time_job(self, reminder_id: int, chat_id: int, 
+    def add_one_time_job(self, reminder_id: str, chat_id: int, 
                          run_date: datetime, text: str,
                          image_file_id: Optional[str] = None) -> str:
         """Add a one-time reminder job"""
@@ -90,7 +88,7 @@ class ReminderScheduler:
         logger.info(f"Added one-time job {job_id} for {run_date}")
         return job_id
     
-    def add_daily_job(self, reminder_id: int, chat_id: int,
+    def add_daily_job(self, reminder_id: str, chat_id: int,
                       hour: int, minute: int, text: str,
                       image_file_id: Optional[str] = None) -> str:
         """Add a daily recurring reminder job"""
@@ -114,7 +112,7 @@ class ReminderScheduler:
         logger.info(f"Added daily job {job_id} at {hour:02d}:{minute:02d} UTC")
         return job_id
     
-    def add_weekly_job(self, reminder_id: int, chat_id: int,
+    def add_weekly_job(self, reminder_id: str, chat_id: int,
                        days_of_week: List[int], hour: int, minute: int,
                        text: str, image_file_id: Optional[str] = None) -> str:
         """Add a weekly recurring reminder job"""
@@ -143,7 +141,7 @@ class ReminderScheduler:
         logger.info(f"Added weekly job {job_id} for days {days_str} at {hour:02d}:{minute:02d} UTC")
         return job_id
     
-    def add_snooze_job(self, reminder_id: int, chat_id: int,
+    def add_snooze_job(self, reminder_id: str, chat_id: int,
                        delay_minutes: int, text: str,
                        image_file_id: Optional[str] = None) -> str:
         """Add a snooze job for a reminder"""
@@ -190,13 +188,12 @@ class ReminderScheduler:
             return job.next_run_time
         return None
     
-    def reload_reminders(self, db_session_factory, get_active_reminders_func):
-        """Reload all active reminders from database"""
-        from sqlalchemy.orm import Session
+    def reload_reminders(self):
+        """Reload all active reminders from MongoDB"""
+        from database import get_active_reminders
         
-        db: Session = db_session_factory()
         try:
-            reminders = get_active_reminders_func(db)
+            reminders = get_active_reminders()
             count = 0
             
             for reminder in reminders:
@@ -225,7 +222,7 @@ class ReminderScheduler:
                         )
                     
                     elif reminder.type == 'weekly':
-                        days = json.loads(reminder.days_of_week) if isinstance(reminder.days_of_week, str) else (reminder.days_of_week or [])
+                        days = reminder.days_of_week if isinstance(reminder.days_of_week, list) else []
                         self.add_weekly_job(
                             reminder.id, reminder.chat_id,
                             days, time_utc.hour, time_utc.minute,
@@ -239,5 +236,6 @@ class ReminderScheduler:
             logger.info(f"Reloaded {count} reminders")
             return count
             
-        finally:
-            db.close()
+        except Exception as e:
+            logger.error(f"Failed to reload reminders: {e}")
+            return 0
