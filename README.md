@@ -1,62 +1,52 @@
 # Telegram Reminder Bot
 
-A powerful, accurate Telegram reminder bot with flexible scheduling, snooze functionality, and image support.
+IST-based reminder bot with single, bulk, date-based, and recurring (daily/weekly) reminders.
+Persists to SQLite (`reminders.db`) so scheduled reminders survive a restart on Render.
 
-## Features
+## Setup
 
-- ✅ **Accurate Timing** - Uses APScheduler with proper triggers, not polling
-- 🔄 **Flexible Scheduling** - One-time, daily, weekly, and relative time reminders
-- 😴 **Snooze Functionality** - Customizable snooze buttons on every reminder
-- 📸 **Image Reminders** - Set reminders with images as context
-- 📋 **Bulk Reminders** - Set multiple reminders at once
-- 🕐 **Timezone Support** - User-specific timezone handling
-- 💾 **Persistent Storage** - SQLite/PostgreSQL database
-- 🚀 **Ready for Deployment** - Works on Render's free tier
+```bash
+pip install -r requirements.txt
+export BOT_TOKEN="your_bot_father_token"
+python bot.py
+```
+
+## Deploy on Render
+
+1. Push this folder to a GitHub repo.
+2. New → Web Service → connect repo (uses `render.yaml`).
+3. Set env var `BOT_TOKEN` in the Render dashboard.
+4. Deploy. Free tier needs the bot to bind to `$PORT` — already handled via
+   a tiny aiohttp keep-alive server started in `post_init` (same event loop,
+   no extra threads, so it won't hit the Python 3.14 strict-threading issue).
+
+Note: Render's free disk isn't guaranteed persistent across deploys — `reminders.db`
+survives restarts/sleep but not a fresh deploy. Fine for personal use; swap in a
+Render Postgres/persistent disk if that matters to you.
 
 ## Commands
 
-### Basic Commands
+```
+/remind today 5:30 pm - call mom
+/remind tomorrow 9:00 am - submit report
+/remind 17.08.2026 - birth wish him        # no time -> defaults to 9:00 AM
+/remind daily 7:00 am - drink water
+/remind weekly mon 9:00 am - team sync
 
-| Command | Description | Example |
-|---------|-------------|---------|
-| `/start` | Start the bot | `/start` |
-| `/help` | Show help | `/help` |
-| `/list` | List all reminders | `/list` |
+/bulkremind
+today 1:50 pm - make coffee
+today 1:52 pm - make tea
+today 1:59 pm - do hw
+17.08.2026 - birth wish him
+daily 6:30 am - gym
 
-### Setting Reminders
+/myreminders          # list active, with ids
+/cancel <id>          # cancel one
+```
 
-| Command | Description | Example |
-|---------|-------------|---------|
-| `/remind HH:MM text` | Remind today at time | `/remind 16:00 Make coffee` |
-| `/remind YYYY-MM-DD HH:MM text` | Specific date/time | `/remind 2026-08-10 16:00 Buy gift` |
-| `/remind today HH:MM text` | Today at time | `/remind today 18:00 Walk dog` |
-| `/remind tomorrow HH:MM text` | Tomorrow at time | `/remind tomorrow 09:00 Meeting` |
-| `/remind daily HH:MM text` | Daily recurring | `/remind daily 07:00 Wake up` |
-| `/remind weekly day,day HH:MM text` | Weekly recurring | `/remind weekly mon,wed,fri 18:00 Gym` |
-| `/remind in Xm text` | In X minutes | `/remind in 30m Take medicine` |
-| `/remind in Xh text` | In X hours | `/remind in 2h Call mom` |
+## Format notes
 
-### Managing Reminders
-
-| Command | Description | Example |
-|---------|-------------|---------|
-| `/edit ID changes` | Edit a reminder | `/edit 5 17:00 Buy groceries` |
-| `/delete ID` | Delete a reminder | `/delete 5` |
-| `/done ID` | Mark as done | `/done 5` |
-
-### Settings
-
-| Command | Description | Example |
-|---------|-------------|---------|
-| `/timezone Area/City` | Set timezone | `/timezone America/New_York` |
-| `/snoozes 5,10,15` | Custom snooze options | `/snoozes 3,7,12` |
-
-### Advanced Features
-
-| Command | Description | Example |
-|---------|-------------|---------|
-| `/bulkremind` | Multiple reminders at once | See below |
-| `/imgremind time text` | Reminder with image | Send photo with caption |
-
-### Bulk Remind Example
-
+- Date: `today`, `tomorrow`, or `DD.MM.YYYY`
+- Time: 12-hour (`5:30 pm`, `9:00am`) or 24-hour (`17:30`) — always interpreted in IST
+- Recurring: `daily <time> - msg` or `weekly <mon|tue|wed|thu|fri|sat|sun> <time> - msg`
+- Separator between date/time and message must be ` - ` (space-dash-space)
