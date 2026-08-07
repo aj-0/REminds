@@ -1,9 +1,10 @@
-envVars:
+services:
+  - type: web
+    name: telegram-reminder-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: MONGODB_URL
-        sync: false        # you'll paste your Atlas connection string in the Render dashboard
-      - key: MONGODB_DB_NAME
-        value: reminder_bot
-      - key: PORT
-        value: 10000
