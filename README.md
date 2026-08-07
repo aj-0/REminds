@@ -1,4 +1,4 @@
-**REminds** a Telegram Reminder Bot 
+#**REminds** a Telegram Reminder Bot 
 <img width="1742" height="1186" alt="image" src="https://github.com/user-attachments/assets/000b2223-be39-4ff9-9434-5af956873f84" />
 
 ## I built this bot for my personal use, designed to suit my workflow. It provides flexible and customizable task reminders.
