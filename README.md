@@ -1,7 +1,5 @@
 # Telegram Reminder Bot _ (Personal_Bot)
-
-IST-based reminder bot with single, bulk, date-based, and recurring (daily/weekly) reminders.
-Persists to SQLite (`reminders.db`) so scheduled reminders survive a restart on Render.
+I built this bot for my personal use, designed to suit my workflow. It provides flexible and customizable task reminders.
 
 ## Setup
 
@@ -18,29 +16,12 @@ Note: Render's free disk isn't guaranteed persistent across deploys — `reminde
 survives restarts/sleep but not a fresh deploy. Fine for personal use; swap in a
 Render Postgres/persistent disk if that matters to you.
 
-## Commands
-
-```
-/remind today 5:30 pm - call mom
-/remind tomorrow 9:00 am - submit report
-/remind 17.08.2026 - birth wish him        # no time -> defaults to 9:00 AM
-/remind daily 7:00 am - drink water
-/remind weekly mon 9:00 am - team sync
-
-/bulkremind
-today 1:50 pm - make coffee
-today 1:52 pm - make tea
-today 1:59 pm - do hw
-17.08.2026 - birth wish him
-daily 6:30 am - gym
-
-/myreminders          # list active, with ids
-/cancel <id>          # cancel one
-```
-
-## Format notes
-
-- Date: `today`, `tomorrow`, or `DD.MM.YYYY`
-- Time: 12-hour (`5:30 pm`, `9:00am`) or 24-hour (`17:30`) — always interpreted in IST
-- Recurring: `daily <time> - msg` or `weekly <mon|tue|wed|thu|fri|sat|sun> <time> - msg`
-- Separator between date/time and message must be ` - ` (space-dash-space)
+Features 
+* Recurring reminders
+* Bulk reminder creation with a single command
+* Date and time-based reminders
+* Telegram notification delivery
+* Customizable reminder messages
+* Reminder editing and deletion
+* Simple command-based interface
+* Designed to suit my personal workflow
