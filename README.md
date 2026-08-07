@@ -1,4 +1,6 @@
-# Telegram Reminder Bot _ (Personal_Bot)
+# Telegram Reminder Bot 
+<img width="1730" height="1166" alt="image" src="https://github.com/user-attachments/assets/8719427e-e454-4951-a469-fb6f95cdb8a3" />
+
 I built this bot for my personal use, designed to suit my workflow. It provides flexible and customizable task reminders.
 
 ## Setup
