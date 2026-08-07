@@ -1,21 +1,15 @@
-# Telegram Reminder Bot
+# Telegram Reminder Bot _ (Personal_Bot)
 
 IST-based reminder bot with single, bulk, date-based, and recurring (daily/weekly) reminders.
 Persists to SQLite (`reminders.db`) so scheduled reminders survive a restart on Render.
 
 ## Setup
 
-```bash
-pip install -r requirements.txt
-export BOT_TOKEN="your_bot_father_token"
-python bot.py
-```
-
 ## Deploy on Render
 
-1. Push this folder to a GitHub repo.
-2. New → Web Service → connect repo (uses `render.yaml`).
-3. Set env var `BOT_TOKEN` in the Render dashboard.
+1. push this repo in your github
+2. render.com : New → Web Service → connect repo (uses `render.yaml`).
+3. Set environment var `BOT_TOKEN` in the Render dashboard.
 4. Deploy. Free tier needs the bot to bind to `$PORT` — already handled via
    a tiny aiohttp keep-alive server started in `post_init` (same event loop,
    no extra threads, so it won't hit the Python 3.14 strict-threading issue).
