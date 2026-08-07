@@ -1,8 +1,8 @@
 # Telegram Reminder Bot 
-<img width="1753" height="1178" alt="image" src="https://github.com/user-attachments/assets/8103700d-891b-4142-980b-759a54af6a1e" />
+<img width="1728" height="1195" alt="image" src="https://github.com/user-attachments/assets/62d9c627-6a9d-40dd-875d-d4bf83d82b09" />
 
 ## I built this bot for my personal use, designed to suit my workflow. It provides flexible and customizable task reminders.
-username : @REminds_Assist_of_AJ_bot
+## Username : @REminds_Assist_of_AJ_bot
 
 ## Deploy on Render
 
