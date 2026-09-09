@@ -24,17 +24,18 @@ DEFAULT_CHECKLIST = [
 
 
 @contextmanager
+def get_conn():
 def _conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
         conn.commit()
-    finally:
-        conn.close()
+@@ -15,69 +35,183 @@ def get_conn():
 
 
 def init_db():
+    with get_conn() as conn:
     with _conn() as conn:
         conn.execute(
             """
@@ -49,6 +50,11 @@ def init_db():
             CREATE TABLE IF NOT EXISTS reminders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
+                message TEXT NOT NULL,
+                next_run TEXT NOT NULL,   -- UTC isoformat
+                recurrence TEXT,          -- NULL | 'daily' | 'weekly'
+                weekday INTEGER,          -- 0=Mon .. 6=Sun, only for weekly
+                active INTEGER DEFAULT 1
                 time TEXT NOT NULL,
                 text TEXT NOT NULL,
                 done INTEGER NOT NULL DEFAULT 0,
@@ -117,13 +123,19 @@ def add_reminder(chat_id: int, time_str: str, text: str):
         )
 
 
+def add_reminder(chat_id, message, next_run_utc_iso, recurrence=None, weekday=None):
+    with get_conn() as conn:
 def edit_reminder(chat_id: int, reminder_id: int, time_str: str = None, text: str = None) -> bool:
     if time_str is None and text is None:
         return False
     with _conn() as conn:
         cur = conn.execute(
+            "INSERT INTO reminders (chat_id, message, next_run, recurrence, weekday) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (chat_id, message, next_run_utc_iso, recurrence, weekday),
             "SELECT 1 FROM reminders WHERE id = ? AND chat_id = ?", (reminder_id, chat_id)
         )
+        return cur.lastrowid
         if cur.fetchone() is None:
             return False
         if time_str is not None:
@@ -139,14 +151,23 @@ def edit_reminder(chat_id: int, reminder_id: int, time_str: str = None, text: st
         return True
 
 
+def get_due(now_utc_iso):
+    with get_conn() as conn:
 def delete_reminder(chat_id: int, reminder_id: int) -> bool:
     with _conn() as conn:
         cur = conn.execute(
+            "SELECT id, chat_id, message, next_run, recurrence, weekday "
+            "FROM reminders WHERE active=1 AND next_run<=?",
+            (now_utc_iso,),
             "DELETE FROM reminders WHERE id = ? AND chat_id = ?", (reminder_id, chat_id)
         )
+        return cur.fetchall()
         return cur.rowcount > 0
 
 
+def deactivate(reminder_id):
+    with get_conn() as conn:
+        conn.execute("UPDATE reminders SET active=0 WHERE id=?", (reminder_id,))
 def set_done(chat_id: int, reminder_id: int, done: int):
     with _conn() as conn:
         conn.execute(
@@ -155,14 +176,24 @@ def set_done(chat_id: int, reminder_id: int, done: int):
         )
 
 
+def update_next_run(reminder_id, next_run_utc_iso):
+    with get_conn() as conn:
 def mark_sent(reminder_id: int, today_str: str):
     with _conn() as conn:
         conn.execute(
+            "UPDATE reminders SET next_run=? WHERE id=?",
+            (next_run_utc_iso, reminder_id),
             "UPDATE reminders SET last_sent_date = ?, done = 0 WHERE id = ?",
             (today_str, reminder_id),
         )
 
 
+def list_active(chat_id):
+    with get_conn() as conn:
+        cur = conn.execute(
+            "SELECT id, message, next_run, recurrence, weekday "
+            "FROM reminders WHERE active=1 AND chat_id=? ORDER BY next_run",
+            (chat_id,),
 def get_timezone(chat_id: int) -> str:
     with _conn() as conn:
         row = conn.execute(
@@ -176,8 +207,14 @@ def set_timezone(chat_id: int, tz_name: str):
         conn.execute(
             "UPDATE users SET timezone = ? WHERE chat_id = ?", (tz_name, chat_id)
         )
+        return cur.fetchall()
 
 
+def get_reminder(reminder_id, chat_id):
+    with get_conn() as conn:
+        cur = conn.execute(
+            "SELECT id FROM reminders WHERE id=? AND chat_id=? AND active=1",
+            (reminder_id, chat_id),
 def get_all_users():
     with _conn() as conn:
         rows = conn.execute("SELECT chat_id FROM users").fetchall()
@@ -197,6 +234,7 @@ def snooze_reminder(reminder_id: int, minutes: int, now_utc: datetime = None):
             "UPDATE reminders SET snooze_until = ? WHERE id = ?",
             (snooze_until.isoformat(), reminder_id),
         )
+        return cur.fetchone()
 
 
 def clear_snooze(reminder_id: int):
