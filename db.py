@@ -1,7 +1,10 @@
 """
 SQLite storage for reminders.
-Table: reminders(id, chat_id, hour, minute, text, created_at)
-Time is stored in 24h (hour, minute) for easy scheduling.
+Table: reminders(id, chat_id, message, next_run_ts, recurrence, weekday, created_at)
+
+next_run_ts: unix epoch seconds (UTC) of the next time this reminder should fire.
+recurrence:  NULL (one-off), 'daily', or 'weekly'
+weekday:     0=Mon..6=Sun, only set when recurrence == 'weekly'
 """
 import sqlite3
 from contextlib import contextmanager
@@ -16,9 +19,10 @@ def init_db():
             CREATE TABLE IF NOT EXISTS reminders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
-                hour INTEGER NOT NULL,
-                minute INTEGER NOT NULL,
-                text TEXT NOT NULL,
+                message TEXT NOT NULL,
+                next_run_ts INTEGER NOT NULL,
+                recurrence TEXT,
+                weekday INTEGER,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
@@ -36,43 +40,39 @@ def get_conn():
         conn.close()
 
 
-def add_reminder(chat_id: int, hour: int, minute: int, text: str) -> int:
+def add_reminder(chat_id: int, message: str, next_run_ts: int, recurrence: str | None, weekday: int | None) -> int:
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO reminders (chat_id, hour, minute, text) VALUES (?, ?, ?, ?)",
-            (chat_id, hour, minute, text),
+            "INSERT INTO reminders (chat_id, message, next_run_ts, recurrence, weekday) VALUES (?, ?, ?, ?, ?)",
+            (chat_id, message, next_run_ts, recurrence, weekday),
         )
         conn.commit()
         return cur.lastrowid
 
 
-def add_reminders_bulk(chat_id: int, items: list[tuple[int, int, str]]) -> list[int]:
-    ids = []
-    with get_conn() as conn:
-        for hour, minute, text in items:
-            cur = conn.execute(
-                "INSERT INTO reminders (chat_id, hour, minute, text) VALUES (?, ?, ?, ?)",
-                (chat_id, hour, minute, text),
-            )
-            ids.append(cur.lastrowid)
-        conn.commit()
-    return ids
-
-
 def get_reminders(chat_id: int):
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM reminders WHERE chat_id = ? ORDER BY hour, minute",
+        return conn.execute(
+            "SELECT * FROM reminders WHERE chat_id = ? ORDER BY next_run_ts",
             (chat_id,),
         ).fetchall()
-        return rows
 
 
-def get_all_reminders():
-    """Used on bot startup to reschedule every job for every chat."""
+def get_due_reminders(now_ts: int):
     with get_conn() as conn:
-        rows = conn.execute("SELECT * FROM reminders ORDER BY hour, minute").fetchall()
-        return rows
+        return conn.execute(
+            "SELECT * FROM reminders WHERE next_run_ts <= ?",
+            (now_ts,),
+        ).fetchall()
+
+
+def update_next_run(reminder_id: int, new_ts: int):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE reminders SET next_run_ts = ? WHERE id = ?",
+            (new_ts, reminder_id),
+        )
+        conn.commit()
 
 
 def delete_reminder(chat_id: int, reminder_id: int) -> bool:
@@ -84,18 +84,14 @@ def delete_reminder(chat_id: int, reminder_id: int) -> bool:
         return cur.rowcount > 0
 
 
+def delete_by_id(reminder_id: int):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+        conn.commit()
+
+
 def clear_reminders(chat_id: int) -> int:
     with get_conn() as conn:
         cur = conn.execute("DELETE FROM reminders WHERE chat_id = ?", (chat_id,))
         conn.commit()
         return cur.rowcount
-
-
-def update_reminder_time(chat_id: int, reminder_id: int, hour: int, minute: int) -> bool:
-    with get_conn() as conn:
-        cur = conn.execute(
-            "UPDATE reminders SET hour = ?, minute = ? WHERE chat_id = ? AND id = ?",
-            (hour, minute, chat_id, reminder_id),
-        )
-        conn.commit()
-        return cur.rowcount > 0
