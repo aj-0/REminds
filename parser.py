@@ -33,12 +33,11 @@ def parse_hhmm(text: str):
 
     raise ValueError(f"Couldn't parse time from '{text}' (use e.g. '5:30 pm')")
 
-
 def parse_date_token(token: str, today: date):
     token = token.strip().lower()
-    if token == "today":
+    if token in ("today", "tdy"):
         return today
-    if token == "tomorrow":
+    if token in ("tomorrow", "tmrw"):
         return today + timedelta(days=1)
     m = _DATE_RE.match(token)
     if m:
