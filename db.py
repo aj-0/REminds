@@ -81,3 +81,12 @@ def get_reminder(reminder_id, chat_id):
             (reminder_id, chat_id),
         )
         return cur.fetchone()
+
+def get_reminder_by_id(reminder_id):
+    with get_conn() as conn:
+        cur = conn.execute(
+            "SELECT id, chat_id, message, next_run, recurrence, weekday "
+            "FROM reminders WHERE id=?",
+            (reminder_id,),
+        )
+        return cur.fetchone()
