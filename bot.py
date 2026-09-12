@@ -3,8 +3,10 @@ import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes,
+)
 
 import db
 from parser import parse_line, IST
@@ -15,10 +17,20 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 PORT = int(os.environ.get("PORT", 8080))
 
+SNOOZE_OPTIONS = [5, 10, 15, 30]
+
 
 def fmt_ist(next_run_utc_iso: str) -> str:
     dt = datetime.fromisoformat(next_run_utc_iso).astimezone(IST)
     return dt.strftime("%d %b %Y, %I:%M %p IST")
+
+
+def snooze_keyboard(rid: int) -> InlineKeyboardMarkup:
+    row = [
+        InlineKeyboardButton(f"{m} min", callback_data=f"snooze:{rid}:{m}")
+        for m in SNOOZE_OPTIONS
+    ]
+    return InlineKeyboardMarkup([row])
 
 
 HELP_TEXT = (
@@ -37,7 +49,8 @@ HELP_TEXT = (
     "  17.08.2026 - birth wish him\n"
     "  daily 6:30 am - gym\n\n"
     "*/myreminders* - list active reminders\n"
-    "*/cancel <id>* - cancel one (id from /myreminders)"
+    "*/cancel <id>* - cancel one (id from /myreminders)\n\n"
+    "When a reminder fires, tap a snooze button (5/10/15/30 min) to re-fire it later."
 )
 
 
@@ -124,7 +137,11 @@ async def check_due(context: ContextTypes.DEFAULT_TYPE):
     due = db.get_due(now_utc_iso)
     for rid, chat_id, message, next_run, recurrence, weekday in due:
         try:
-            await context.bot.send_message(chat_id=chat_id, text=f"⏰ Reminder: {message}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⏰ Reminder: {message}",
+                reply_markup=snooze_keyboard(rid),
+            )
         except Exception:
             logger.exception(f"Failed to send reminder #{rid}")
 
@@ -136,6 +153,34 @@ async def check_due(context: ContextTypes.DEFAULT_TYPE):
             db.update_next_run(rid, new_run.isoformat())
         else:
             db.deactivate(rid)
+
+
+async def snooze_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, rid_s, minutes_s = query.data.split(":")
+        rid, minutes = int(rid_s), int(minutes_s)
+    except (ValueError, AttributeError):
+        return
+
+    row = db.get_reminder_by_id(rid)
+    if not row:
+        await query.edit_message_text(f"{query.message.text}\n\n⚠️ Original reminder not found.")
+        return
+
+    _, chat_id, message, _, _, _ = row
+    if chat_id != query.message.chat_id:
+        return  # belongs to a different chat, ignore
+
+    next_run_utc = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+    new_rid = db.add_reminder(chat_id, message, next_run_utc.isoformat(), None, None)
+
+    await query.edit_message_text(
+        f"{query.message.text}\n\n😴 Snoozed {minutes} min (#{new_rid}) — "
+        f"{fmt_ist(next_run_utc.isoformat())}"
+    )
 
 
 async def post_init(application: Application):
@@ -168,6 +213,7 @@ def main():
     application.add_handler(CommandHandler("bulkremind", bulkremind_cmd))
     application.add_handler(CommandHandler("myreminders", myreminders_cmd))
     application.add_handler(CommandHandler("cancel", cancel_cmd))
+    application.add_handler(CallbackQueryHandler(snooze_cb, pattern=r"^snooze:\d+:\d+$"))
 
     application.job_queue.run_repeating(check_due, interval=30, first=10)
 
