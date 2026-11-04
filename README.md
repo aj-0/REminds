@@ -22,6 +22,7 @@ Features
 * Bulk reminder creation with a single command
 * Date and time-based reminders
 * Telegram notification delivery
+* Reminders repeat every 4 minutes until you reply "ACK" (reply to a reminder, plain `ACK` for all, or `ACK <id>`)
 * Customizable reminder messages
 * Reminder editing and deletion
 * Simple command-based interface

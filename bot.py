@@ -1,10 +1,11 @@
 import os
+import re
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 import db
 from parser import parse_line, IST
@@ -15,10 +16,44 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 PORT = int(os.environ.get("PORT", 8080))
 
+# Unacknowledged reminders are resent at this interval until the user replies "ACK".
+ACK_RESEND_INTERVAL = timedelta(minutes=4)
+
+# Matches "ACK", "ack", "/ack", "ACK 325", "ACK #325 #326", "/ack@MyBot 12"
+ACK_RE = re.compile(r"^\s*/?ack(?:@\w+)?((?:[\s,#]+\d+)*)\s*[.!]?\s*$", re.IGNORECASE)
+
 
 def fmt_ist(next_run_utc_iso: str) -> str:
     dt = datetime.fromisoformat(next_run_utc_iso).astimezone(IST)
     return dt.strftime("%d %b %Y, %I:%M %p IST")
+
+
+def time_of_day_emoji(dt_ist: datetime) -> str:
+    h = dt_ist.hour
+    if 5 <= h < 12:
+        return "🌞"  # morning
+    if 12 <= h < 17:
+        return "☀️"  # afternoon
+    if 17 <= h < 21:
+        return "🌆"  # evening
+    return "🌙"  # night
+
+
+def fmt_scheduled(rid: int, next_run_utc_iso: str, message: str, recurrence: str | None) -> str:
+    """One entry of the '✅ Scheduled:' confirmation, e.g.
+
+    #325 — 07 Nov 2026, 09:00 AM 🌞 (IST)
+
+    — Beetroot Juice, Face Tan & Skincare Products
+    """
+    dt = datetime.fromisoformat(next_run_utc_iso).astimezone(IST)
+    tz = f"(IST, {recurrence})" if recurrence else "(IST)"
+    when = dt.strftime("%d %b %Y, %I:%M %p")
+    return f"#{rid} — {when} {time_of_day_emoji(dt)} {tz}\n\n— {message}"
+
+
+def notification_text(rid: int, message: str) -> str:
+    return f"⏰ Reminder #{rid}: {message}\n\nReply ACK to acknowledge."
 
 
 HELP_TEXT = (
@@ -37,7 +72,11 @@ HELP_TEXT = (
     "  17.08.2026 - birth wish him\n"
     "  daily 6:30 am - gym\n\n"
     "*/myreminders* - list active reminders\n"
-    "*/cancel <id>* - cancel one (id from /myreminders)"
+    "*/cancel <id>* - cancel one (id from /myreminders)\n\n"
+    "*ACK* - every reminder repeats every 4 minutes until you reply ACK\n"
+    "  ACK  (as a reply to a reminder) - acknowledge that reminder\n"
+    "  ACK  (plain message) - acknowledge all pending reminders\n"
+    "  ACK 325 - acknowledge reminder #325"
 )
 
 
@@ -57,14 +96,13 @@ async def _create_reminders(update: Update, lines: list[str]):
                 chat_id, parsed["message"], next_run_utc,
                 parsed["recurrence"], parsed["weekday"],
             )
-            tag = f" ({parsed['recurrence']})" if parsed["recurrence"] else ""
-            ok.append(f"#{rid}{tag} {fmt_ist(next_run_utc)} — {parsed['message']}")
+            ok.append(fmt_scheduled(rid, next_run_utc, parsed["message"], parsed["recurrence"]))
         except ValueError as e:
             errors.append(str(e))
 
     reply = ""
     if ok:
-        reply += "✅ Scheduled:\n" + "\n".join(ok) + "\n"
+        reply += "✅ Scheduled:\n\n" + "\n\n".join(ok) + "\n"
     if errors:
         reply += "\n❌ Failed:\n" + "\n".join(errors)
     await update.message.reply_text(reply.strip() or "Nothing scheduled.")
@@ -95,14 +133,18 @@ async def bulkremind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def myreminders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = db.list_active(update.effective_chat.id)
-    if not rows:
+    pending = db.list_unacked(update.effective_chat.id)
+    if not rows and not pending:
         await update.message.reply_text("No active reminders.")
         return
     lines = []
     for rid, message, next_run, recurrence, weekday in rows:
         tag = f" ({recurrence})" if recurrence else ""
         lines.append(f"#{rid}{tag} {fmt_ist(next_run)} — {message}")
-    await update.message.reply_text("\n".join(lines))
+    if pending:
+        tags = ", ".join(f"#{r}" for r in sorted({p[0] for p in pending}))
+        lines.append(f"\n⚠️ Awaiting ACK: {tags}")
+    await update.message.reply_text("\n".join(lines).strip())
 
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -112,21 +154,69 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /cancel <id>  (see /myreminders)")
         return
     rid = int(args[0])
+    # Cancelling also stops any pending "ACK" resends for that reminder.
+    stopped = db.ack_reminder(chat_id, rid)
     if db.get_reminder(rid, chat_id):
         db.deactivate(rid)
         await update.message.reply_text(f"Cancelled #{rid}.")
+    elif stopped:
+        await update.message.reply_text(f"Stopped repeating #{rid}.")
     else:
         await update.message.reply_text(f"No active reminder #{rid} for you.")
 
 
+async def ack_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    m = ACK_RE.match(msg.text or "")
+    if not m:
+        return
+    chat_id = update.effective_chat.id
+    ids = [int(x) for x in re.findall(r"\d+", m.group(1) or "")]
+
+    acked: list[int] = []
+    if ids:
+        for rid in ids:
+            acked += db.ack_reminder(chat_id, rid)
+    else:
+        if msg.reply_to_message:
+            acked = db.ack_by_message(chat_id, msg.reply_to_message.message_id)
+        if not acked:
+            acked = db.ack_all(chat_id)
+
+    if acked:
+        tags = ", ".join(f"#{r}" for r in sorted(set(acked)))
+        await msg.reply_text(f"👍 Acknowledged {tags}. No more repeats.")
+    else:
+        await msg.reply_text("Nothing pending to acknowledge.")
+
+
+async def _send_notification(bot, notification_id: int, chat_id: int, text: str):
+    try:
+        sent = await bot.send_message(chat_id=chat_id, text=text)
+        db.record_notification_message(notification_id, chat_id, sent.message_id)
+    except Exception:
+        logger.exception(f"Failed to send notification {notification_id}")
+
+
 async def check_due(context: ContextTypes.DEFAULT_TYPE):
-    now_utc_iso = datetime.now(timezone.utc).isoformat()
+    now_utc = datetime.now(timezone.utc)
+    now_utc_iso = now_utc.isoformat()
+    next_resend_iso = (now_utc + ACK_RESEND_INTERVAL).isoformat()
+
+    # 1) Resend notifications still waiting for an ACK (every 4 minutes).
+    for nid, rid, chat_id, text, send_count in db.get_resends_due(now_utc_iso):
+        db.bump_resend(nid, next_resend_iso)
+        await _send_notification(
+            context.bot, nid, chat_id,
+            f"🔁 Repeat {send_count} — not acknowledged yet\n\n{text}",
+        )
+
+    # 2) Fire newly due reminders; each one then waits for an ACK.
     due = db.get_due(now_utc_iso)
     for rid, chat_id, message, next_run, recurrence, weekday in due:
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=f"⏰ Reminder: {message}")
-        except Exception:
-            logger.exception(f"Failed to send reminder #{rid}")
+        text = notification_text(rid, message)
+        nid = db.add_notification(rid, chat_id, text, next_resend_iso)
+        await _send_notification(context.bot, nid, chat_id, text)
 
         if recurrence == "daily":
             new_run = datetime.fromisoformat(next_run) + timedelta(days=1)
@@ -160,6 +250,7 @@ def main():
         asyncio.set_event_loop(asyncio.new_event_loop())
 
     db.init_db()
+    db.init_ack_tables()
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     application.add_handler(CommandHandler("start", start))
@@ -168,6 +259,8 @@ def main():
     application.add_handler(CommandHandler("bulkremind", bulkremind_cmd))
     application.add_handler(CommandHandler("myreminders", myreminders_cmd))
     application.add_handler(CommandHandler("cancel", cancel_cmd))
+    # "ACK", "/ack", "ACK 325" — plain text or command form.
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(ACK_RE), ack_handler))
 
     application.job_queue.run_repeating(check_due, interval=30, first=10)
 
