@@ -22,6 +22,10 @@ ACK_RESEND_INTERVAL = timedelta(minutes=4)
 # Matches "ACK", "ack", "/ack", "ACK 325", "ACK #325 #326", "/ack@MyBot 12"
 ACK_RE = re.compile(r"^\s*/?ack(?:@\w+)?((?:[\s,#]+\d+)*)\s*[.!]?\s*$", re.IGNORECASE)
 
+# A message that is just a number = snooze pending reminders for that many minutes.
+SNOOZE_RE = re.compile(r"^\s*(\d+)\s*$")
+MAX_SNOOZE_MINUTES = 24 * 60
+
 
 def fmt_ist(next_run_utc_iso: str) -> str:
     dt = datetime.fromisoformat(next_run_utc_iso).astimezone(IST)
@@ -53,7 +57,7 @@ def fmt_scheduled(rid: int, next_run_utc_iso: str, message: str, recurrence: str
 
 
 def notification_text(rid: int, message: str) -> str:
-    return f"⏰ Reminder #{rid}: {message}\n\nReply ACK to acknowledge."
+    return f"⏰ Reminder #{rid}: {message}\n\nACK:🥱?"
 
 
 HELP_TEXT = (
@@ -76,7 +80,10 @@ HELP_TEXT = (
     "*ACK* - every reminder repeats every 4 minutes until you reply ACK\n"
     "  ACK  (as a reply to a reminder) - acknowledge that reminder\n"
     "  ACK  (plain message) - acknowledge all pending reminders\n"
-    "  ACK 325 - acknowledge reminder #325"
+    "  ACK 325 - acknowledge reminder #325\n\n"
+    "*Snooze* - send any number of minutes, e.g. 10\n"
+    "  pauses repeats for that long, then they resume every 4 minutes\n"
+    "  (reply to a reminder to snooze just that one)"
 )
 
 
@@ -184,10 +191,33 @@ async def ack_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             acked = db.ack_all(chat_id)
 
     if acked:
-        tags = ", ".join(f"#{r}" for r in sorted(set(acked)))
-        await msg.reply_text(f"👍 Acknowledged {tags}. No more repeats.")
+        await msg.reply_text("👍")
     else:
         await msg.reply_text("Nothing pending to acknowledge.")
+
+
+async def snooze_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    m = SNOOZE_RE.match(msg.text or "")
+    if not m:
+        return
+    minutes = int(m.group(1))
+    if not 1 <= minutes <= MAX_SNOOZE_MINUTES:
+        await msg.reply_text(f"Snooze must be 1–{MAX_SNOOZE_MINUTES} minutes.")
+        return
+    chat_id = update.effective_chat.id
+    until = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
+
+    snoozed: list[int] = []
+    if msg.reply_to_message:
+        snoozed = db.snooze_by_message(chat_id, msg.reply_to_message.message_id, until)
+    if not snoozed:
+        snoozed = db.snooze_all(chat_id, until)
+
+    if snoozed:
+        await msg.reply_text(f"💤 {minutes}m")
+    else:
+        await msg.reply_text("Nothing pending")
 
 
 async def _send_notification(bot, notification_id: int, chat_id: int, text: str):
@@ -261,6 +291,8 @@ def main():
     application.add_handler(CommandHandler("cancel", cancel_cmd))
     # "ACK", "/ack", "ACK 325" — plain text or command form.
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(ACK_RE), ack_handler))
+    # "10" — snooze pending reminders for 10 minutes.
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(SNOOZE_RE), snooze_handler))
 
     application.job_queue.run_repeating(check_due, interval=30, first=10)
 

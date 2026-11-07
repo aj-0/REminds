@@ -23,6 +23,7 @@ Features
 * Date and time-based reminders
 * Telegram notification delivery
 * Reminders repeat every 4 minutes until you reply "ACK" (reply to a reminder, plain `ACK` for all, or `ACK <id>`)
+* Snooze: send any number of minutes (e.g. `10`) to pause repeats for that long; they then resume every 4 minutes until ACK
 * Customizable reminder messages
 * Reminder editing and deletion
 * Simple command-based interface

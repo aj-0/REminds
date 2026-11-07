@@ -193,6 +193,35 @@ def ack_all(chat_id):
         return _ack_where(conn, "chat_id=?", (chat_id,))
 
 
+def _snooze_where(conn, where, params, until_utc_iso):
+    """Push the next resend of matching unacked notifications; return reminder ids."""
+    rows = conn.execute(
+        f"SELECT id, reminder_id FROM notifications WHERE acked=0 AND {where}", params
+    ).fetchall()
+    if rows:
+        conn.executemany(
+            "UPDATE notifications SET next_resend=? WHERE id=?",
+            [(until_utc_iso, r[0]) for r in rows],
+        )
+    return sorted({r[1] for r in rows})
+
+
+def snooze_by_message(chat_id, message_id, until_utc_iso):
+    with get_conn() as conn:
+        return _snooze_where(
+            conn,
+            "chat_id=? AND id IN (SELECT notification_id FROM notification_messages "
+            "WHERE chat_id=? AND message_id=?)",
+            (chat_id, chat_id, message_id),
+            until_utc_iso,
+        )
+
+
+def snooze_all(chat_id, until_utc_iso):
+    with get_conn() as conn:
+        return _snooze_where(conn, "chat_id=?", (chat_id,), until_utc_iso)
+
+
 def list_unacked(chat_id):
     with get_conn() as conn:
         cur = conn.execute(
