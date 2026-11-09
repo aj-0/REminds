@@ -56,6 +56,18 @@ def deactivate(reminder_id):
         conn.execute("UPDATE reminders SET active=0 WHERE id=?", (reminder_id,))
 
 
+def deactivate_all(chat_id):
+    """Deactivate every active reminder for chat_id; return their ids."""
+    with get_conn() as conn:
+        ids = [r[0] for r in conn.execute(
+            "SELECT id FROM reminders WHERE active=1 AND chat_id=?", (chat_id,)
+        ).fetchall()]
+        conn.execute(
+            "UPDATE reminders SET active=0 WHERE active=1 AND chat_id=?", (chat_id,)
+        )
+        return ids
+
+
 def update_next_run(reminder_id, next_run_utc_iso):
     with get_conn() as conn:
         conn.execute(

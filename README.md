@@ -25,6 +25,6 @@ Features
 * Reminders repeat every 4 minutes until you reply "ACK" (reply to a reminder, plain `ACK` for all, or `ACK <id>`)
 * Snooze: send any number of minutes (e.g. `10`) to pause repeats for that long; they then resume every 4 minutes until ACK
 * Customizable reminder messages
-* Reminder editing and deletion
+* Reminder editing and deletion (`/cancel <id>`, `/clrall` to clear all)
 * Simple command-based interface
 * Designed to suit my personal workflow

@@ -76,7 +76,8 @@ HELP_TEXT = (
     "  17.08.2026 - birth wish him\n"
     "  daily 6:30 am - gym\n\n"
     "*/myreminders* - list active reminders\n"
-    "*/cancel <id>* - cancel one (id from /myreminders)\n\n"
+    "*/cancel <id>* - cancel one (id from /myreminders)\n"
+    "*/clrall* - clear all your reminders and stop all repeats\n\n"
     "*ACK* - every reminder repeats every 4 minutes until you reply ACK\n"
     "  ACK  (as a reply to a reminder) - acknowledge that reminder\n"
     "  ACK  (plain message) - acknowledge all pending reminders\n"
@@ -170,6 +171,17 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Stopped repeating #{rid}.")
     else:
         await update.message.reply_text(f"No active reminder #{rid} for you.")
+
+
+async def clrall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    cleared = db.deactivate_all(chat_id)
+    stopped = db.ack_all(chat_id)  # also stop any pending ACK repeats
+    total = len(set(cleared) | set(stopped))
+    if total:
+        await update.message.reply_text(f"🧹 Cleared {total}")
+    else:
+        await update.message.reply_text("No reminders to clear.")
 
 
 async def ack_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -284,6 +296,7 @@ def main():
     application.add_handler(CommandHandler("bulkremind", bulkremind_cmd))
     application.add_handler(CommandHandler("myreminders", myreminders_cmd))
     application.add_handler(CommandHandler("cancel", cancel_cmd))
+    application.add_handler(CommandHandler("clrall", clrall_cmd))
     # "ACK", "/ack", "ACK 325" — plain text or command form.
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(ACK_RE), ack_handler))
     # "10" — snooze pending reminders for 10 minutes.
