@@ -190,9 +190,8 @@ async def ack_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not acked:
             acked = db.ack_all(chat_id)
 
-    if acked:
-        await msg.reply_text("👍")
-    else:
+    # Acknowledged silently; only complain when there was nothing to ACK.
+    if not acked:
         await msg.reply_text("Nothing pending to acknowledge.")
 
 
@@ -208,16 +207,12 @@ async def snooze_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     until = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
 
+    # Snoozed silently — no confirmation message.
     snoozed: list[int] = []
     if msg.reply_to_message:
         snoozed = db.snooze_by_message(chat_id, msg.reply_to_message.message_id, until)
     if not snoozed:
-        snoozed = db.snooze_all(chat_id, until)
-
-    if snoozed:
-        await msg.reply_text(f"💤 {minutes}m")
-    else:
-        await msg.reply_text("Nothing pending")
+        db.snooze_all(chat_id, until)
 
 
 async def _send_notification(bot, notification_id: int, chat_id: int, text: str):
